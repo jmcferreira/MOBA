@@ -208,7 +208,10 @@ function startOfTurnMaintenance(gameState: GameState): void {
     for (const champion of player.champions) {
       tickRespawn(champion);
       tickCooldowns(champion);
-      resetChampionLaneState(champion);
+      // Reset positioning but NOT assignedLane — that's set by applyPlanningInput
+      // before executeTurn is called and must persist through resolution + battle.
+      champion.currentZone = null;
+      champion.battlePosition = null;
     }
   }
 
