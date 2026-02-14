@@ -84,11 +84,22 @@ export function createGameState(
 
 // ── Turn Execution ──────────────────────────────────────────
 
+export type BattleRunner = (
+  laneId: LaneId,
+  lane: LaneState,
+  p1Champion: Champion,
+  p2Champion: Champion,
+  p1Stance: LaneStance,
+  p2Stance: LaneStance,
+  actionProvider: ActionProvider
+) => BattleOutcome;
+
 export function executeTurn(
   gameState: GameState,
   p1Submission: PlanningSubmission,
   p2Submission: PlanningSubmission,
-  battleActionProvider: ActionProvider
+  battleActionProvider: ActionProvider,
+  customBattleRunner?: BattleRunner
 ): void {
   // Step 0: Start-of-turn maintenance
   startOfTurnMaintenance(gameState);
@@ -165,7 +176,8 @@ export function executeTurn(
 
     if (!p1Champion || !p2Champion) continue;
 
-    const outcome = runBattle(
+    const battleFn = customBattleRunner ?? runBattle;
+    const outcome = battleFn(
       trigger.laneId,
       lane,
       p1Champion,

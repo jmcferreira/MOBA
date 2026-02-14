@@ -1019,7 +1019,7 @@
       turnLog: []
     };
   }
-  function executeTurn(gameState, p1Submission, p2Submission, battleActionProvider) {
+  function executeTurn(gameState, p1Submission, p2Submission, battleActionProvider, customBattleRunner) {
     startOfTurnMaintenance(gameState);
     gameState.phase = "RESOLUTION" /* Resolution */;
     const resolutionResults = [];
@@ -1065,7 +1065,8 @@
       const p1Champion = getActiveLaneChampion(gameState.players[0], trigger.laneId);
       const p2Champion = getActiveLaneChampion(gameState.players[1], trigger.laneId);
       if (!p1Champion || !p2Champion) continue;
-      const outcome = runBattle(
+      const battleFn = customBattleRunner ?? runBattle;
+      const outcome = battleFn(
         trigger.laneId,
         lane,
         p1Champion,
@@ -1488,6 +1489,34 @@
       targetHex: enemyPos
     };
   }
+  function runBattleRecorded(laneId, lane, p1Champion, p2Champion, p1Stance, p2Stance, actionProvider) {
+    const battle = setupBattle(laneId, lane, p1Champion, p2Champion, p1Stance, p2Stance);
+    const frames = [];
+    frames.push({ battleState: structuredClone(battle), action: null });
+    while (!battle.isComplete && battle.roundNumber <= BATTLE_ROUND_LIMIT) {
+      const roundNum = battle.roundNumber;
+      executeBattleRound(battle, actionProvider);
+      frames.push({
+        battleState: structuredClone(battle),
+        action: {
+          actorId: "",
+          actionType: "WAIT" /* Wait */,
+          description: battle.isComplete ? "Battle ends!" : `Round ${roundNum} complete`
+        }
+      });
+    }
+    const outcome = calculateBattleOutcome(battle);
+    battle.outcome = outcome;
+    frames.push({
+      battleState: structuredClone(battle),
+      action: {
+        actorId: "",
+        actionType: "WAIT" /* Wait */,
+        description: outcome.winner ? `${outcome.winner === "PLAYER_1" ? "Player 1" : "Player 2"} wins the battle!` : "Battle ends in a draw!"
+      }
+    });
+    return { outcome, frames };
+  }
   var GameController = class {
     constructor() {
       __publicField(this, "state");
@@ -1496,6 +1525,8 @@
       __publicField(this, "lastTurnLog", null);
       __publicField(this, "message", "Player 1: Choose a card and spawn minions.");
       __publicField(this, "laneId", "MID" /* Mid */);
+      __publicField(this, "battleFrames", []);
+      __publicField(this, "pendingTurnMessage", "");
       resetIdCounter();
       this.state = createGameState(IRONCLAD, PYROX, ALL_PLANNING_CARDS, ["MID" /* Mid */]);
       preparePlanningPhase(this.state);
@@ -1509,6 +1540,7 @@
       this.p1Submission = null;
       this.lastTurnLog = null;
       this.message = "Player 1: Choose a card and spawn minions.";
+      this.battleFrames = [];
     }
     getPlayerHand(playerId) {
       const idx = playerId === "PLAYER_1" ? 0 : 1;
@@ -1566,7 +1598,14 @@
     resolveTurn(p2Submission) {
       this.phase = "RESOLVING";
       const p1Sub = this.p1Submission ?? createEmptySubmission("PLAYER_1");
-      executeTurn(this.state, p1Sub, p2Submission, battleAI);
+      this.battleFrames = [];
+      let recordedFrames = [];
+      const recordingRunner = (lId, ln, p1C, p2C, p1S, p2S, ap) => {
+        const result = runBattleRecorded(lId, ln, p1C, p2C, p1S, p2S, ap);
+        recordedFrames = result.frames;
+        return result.outcome;
+      };
+      executeTurn(this.state, p1Sub, p2Submission, battleAI, recordingRunner);
       this.lastTurnLog = this.state.turnLog[this.state.turnLog.length - 1];
       const res = this.lastTurnLog.resolutionResults[0];
       let msg = `Turn ${this.state.turnNumber - 1} complete. `;
@@ -1580,6 +1619,13 @@
           msg += `Champion killed: ${battle.championDeaths.join(", ")}. `;
         }
       }
+      if (recordedFrames.length > 0) {
+        this.battleFrames = recordedFrames;
+        this.pendingTurnMessage = msg;
+        this.phase = "BATTLE_REPLAY";
+        this.message = "Battle in progress!";
+        return;
+      }
       if (this.state.result !== "IN_PROGRESS" /* InProgress */) {
         this.phase = "GAME_OVER";
         this.message = `GAME OVER: ${this.state.result}`;
@@ -1590,51 +1636,97 @@
         this.message = msg + " Player 1: Choose a card.";
       }
     }
+    /** Called by the UI after battle replay finishes */
+    finishBattle() {
+      this.battleFrames = [];
+      if (this.state.result !== "IN_PROGRESS" /* InProgress */) {
+        this.phase = "GAME_OVER";
+        this.message = `GAME OVER: ${this.state.result}`;
+      } else {
+        preparePlanningPhase(this.state);
+        this.p1Submission = null;
+        this.phase = "P1_PLANNING";
+        this.message = this.pendingTurnMessage + " Player 1: Choose a card.";
+      }
+    }
     getUIState() {
       return {
         gameState: this.state,
         phase: this.phase,
         p1Submission: this.p1Submission,
         lastTurnLog: this.lastTurnLog,
-        message: this.message
+        message: this.message,
+        battleFrames: this.battleFrames
       };
     }
   };
 
-  // src/web/main.ts
-  var controller = new GameController();
-  var selectedCardIndex = -1;
-  var spawnCount = 0;
-  var canvas;
-  var ctx;
-  var buttons = [];
+  // src/web/utils/colors.ts
   var COLORS = {
-    bg: "#1a1a2e",
-    panel: "#16213e",
-    panelLight: "#1c2e4a",
-    accent1: "#e94560",
-    // Player 1 red
-    accent2: "#0f7cba",
-    // Player 2 blue
-    gold: "#f5c518",
-    text: "#eee",
-    textDim: "#888",
-    green: "#44bd32",
-    red: "#e74c3c",
-    lane: "#2d3436",
-    zone: "#3d4a5c",
-    zoneFront: "#5a6e8a",
-    tower: "#f39c12",
-    base: "#e74c3c",
-    card: "#2d3a50",
-    cardHover: "#3d4a60",
-    cardSelected: "#1e6f50",
-    button: "#2ecc71",
-    buttonHover: "#27ae60",
-    stanceAggro: "#e74c3c",
-    stanceDefend: "#3498db",
-    stanceNeutral: "#95a5a6",
-    stanceAmbush: "#9b59b6"
+    // Background
+    bg: "#0d0d1a",
+    // Map terrain
+    mapGrassP1: "#2a4a1a",
+    mapGrassP2: "#1a3a2a",
+    mapGrassCenter: "#2d3a20",
+    lanePath: "#5a4a30",
+    lanePathEdge: "#3a3020",
+    riftLight: "#2dd4bf",
+    riftDark: "#0d6b5e",
+    // Player colors
+    p1: "#c03050",
+    p1Light: "#e05070",
+    p1Dark: "#6b1a2a",
+    p2: "#2060b0",
+    p2Light: "#4080d0",
+    p2Dark: "#0a2a5a",
+    // Structures
+    towerStone: "#8a7a60",
+    towerCrystalP1: "#ff6b6b",
+    towerCrystalP2: "#6bafff",
+    baseWallP1: "#5a2020",
+    baseWallP2: "#20205a",
+    rubble: "#4a4a4a",
+    // UI panels
+    panel: "#0d0d20",
+    panelBorder: "#2a2a40",
+    panelLight: "#1a1a30",
+    // Text
+    text: "#e8e8f0",
+    textDim: "#6a6a80",
+    textGold: "#f0c020",
+    // Functional
+    hpHigh: "#40c040",
+    hpMid: "#d0b030",
+    hpLow: "#e04040",
+    energy: "#40a0e0",
+    shield: "#a0a0c0",
+    gold: "#f0c020",
+    // Cards
+    cardBg: "#161628",
+    cardBorder: "#3a3a50",
+    cardSelected: "#1a5a3a",
+    cardSelectedBorder: "#40c060",
+    // Stances
+    stanceAggro: "#d04040",
+    stanceDefend: "#3080c0",
+    stanceNeutral: "#80809a",
+    stanceAmbush: "#8040b0",
+    // Buttons
+    button: "#2a6b3a",
+    buttonBorder: "#1a4a2a",
+    buttonText: "#e8e8f0",
+    // Battle
+    hexBg: "#2a3a2a",
+    hexBorder: "#4a5a4a",
+    hexP1Tint: "rgba(192, 48, 80, 0.08)",
+    hexP2Tint: "rgba(32, 96, 176, 0.08)",
+    hexHighlight: "#f0c020",
+    hexActive: "rgba(240, 192, 32, 0.3)",
+    // Vegetation
+    treeDark: "#1a4d0a",
+    treeLight: "#2d6b16",
+    treeTrunk: "#4a3520"
   };
   function stanceColor(stance) {
     switch (stance) {
@@ -1648,304 +1740,137 @@
         return COLORS.stanceAmbush;
     }
   }
-  function init() {
-    canvas = document.getElementById("game");
-    ctx = canvas.getContext("2d");
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = 900 * dpr;
-    canvas.height = 700 * dpr;
-    canvas.style.width = "900px";
-    canvas.style.height = "700px";
-    ctx.scale(dpr, dpr);
-    canvas.addEventListener("click", handleClick);
-    render();
+  function playerColor(playerId) {
+    return playerId === "PLAYER_1" ? COLORS.p1 : COLORS.p2;
   }
-  function handleClick(e) {
-    const rect = canvas.getBoundingClientRect();
-    const mx = e.clientX - rect.left;
-    const my = e.clientY - rect.top;
-    for (const btn of buttons) {
-      if (mx >= btn.x && mx <= btn.x + btn.w && my >= btn.y && my <= btn.y + btn.h) {
-        btn.action();
-        render();
-        return;
-      }
+  function playerColorDark(playerId) {
+    return playerId === "PLAYER_1" ? COLORS.p1Dark : COLORS.p2Dark;
+  }
+  function hpColor(pct) {
+    if (pct > 0.5) return COLORS.hpHigh;
+    if (pct > 0.25) return COLORS.hpMid;
+    return COLORS.hpLow;
+  }
+
+  // src/web/utils/draw.ts
+  var FONT = {
+    title: "bold 20px 'Segoe UI', Arial, sans-serif",
+    subtitle: "bold 14px 'Segoe UI', Arial, sans-serif",
+    body: "13px 'Segoe UI', Arial, sans-serif",
+    bodyBold: "bold 13px 'Segoe UI', Arial, sans-serif",
+    small: "11px 'Segoe UI', Arial, sans-serif",
+    smallBold: "bold 11px 'Segoe UI', Arial, sans-serif",
+    tiny: "9px 'Segoe UI', Arial, sans-serif",
+    damage: "bold 16px 'Segoe UI', Arial, sans-serif",
+    mono: "12px monospace",
+    monoBold: "bold 12px monospace"
+  };
+  function roundRect(ctx2, x, y, w, h, r) {
+    ctx2.beginPath();
+    ctx2.moveTo(x + r, y);
+    ctx2.lineTo(x + w - r, y);
+    ctx2.arcTo(x + w, y, x + w, y + r, r);
+    ctx2.lineTo(x + w, y + h - r);
+    ctx2.arcTo(x + w, y + h, x + w - r, y + h, r);
+    ctx2.lineTo(x + r, y + h);
+    ctx2.arcTo(x, y + h, x, y + h - r, r);
+    ctx2.lineTo(x, y + r);
+    ctx2.arcTo(x, y, x + r, y, r);
+    ctx2.closePath();
+  }
+  function drawHpBar(ctx2, x, y, w, h, current, max, showText = true) {
+    const pct = max > 0 ? current / max : 0;
+    ctx2.fillStyle = "#1a1a1a";
+    roundRect(ctx2, x, y, w, h, h / 2);
+    ctx2.fill();
+    if (pct > 0) {
+      ctx2.fillStyle = hpColor(pct);
+      roundRect(ctx2, x, y, w * pct, h, h / 2);
+      ctx2.fill();
+    }
+    ctx2.strokeStyle = "#333";
+    ctx2.lineWidth = 1;
+    roundRect(ctx2, x, y, w, h, h / 2);
+    ctx2.stroke();
+    if (showText && h >= 10) {
+      ctx2.fillStyle = COLORS.text;
+      ctx2.font = h >= 14 ? FONT.small : FONT.tiny;
+      ctx2.textAlign = "center";
+      ctx2.textBaseline = "middle";
+      ctx2.fillText(`${current}/${max}`, x + w / 2, y + h / 2);
     }
   }
-  function render() {
-    buttons = [];
-    const W = 900;
-    const H = 700;
-    const ui = controller.getUIState();
-    const gs = ui.gameState;
-    const lane = gs.lanes["MID"];
-    ctx.fillStyle = COLORS.bg;
-    ctx.fillRect(0, 0, W, H);
-    ctx.fillStyle = COLORS.text;
-    ctx.font = "bold 18px monospace";
-    ctx.textAlign = "center";
-    ctx.fillText(`MOBA BOARD GAME \u2014 Turn ${gs.turnNumber}`, W / 2, 30);
-    renderPlayerStats(gs, "PLAYER_1", 20, 50, 420);
-    renderPlayerStats(gs, "PLAYER_2", 460, 50, 420);
-    renderLane(lane, 50, 130, W - 100, 80);
-    ctx.fillStyle = COLORS.gold;
-    ctx.font = "14px monospace";
-    ctx.textAlign = "center";
-    const msgLines = wordWrap(ui.message, 80);
-    msgLines.forEach((line, i) => {
-      ctx.fillText(line, W / 2, 240 + i * 18);
-    });
-    const currentPlayer = ui.phase === "P1_PLANNING" ? "PLAYER_1" : "PLAYER_2";
-    if (ui.phase === "P1_PLANNING" || ui.phase === "P2_PLANNING") {
-      const playerIdx = currentPlayer === "PLAYER_1" ? 0 : 1;
-      const player = gs.players[playerIdx];
-      const hand = player.hand;
-      const champAlive = controller.isChampionAlive(currentPlayer);
-      if (!champAlive) {
-        ctx.fillStyle = COLORS.red;
-        ctx.font = "16px monospace";
-        ctx.textAlign = "center";
-        ctx.fillText("Champion is dead! Click Skip to continue.", W / 2, 320);
-        addButton(W / 2 - 60, 340, 120, 36, "Skip Turn", () => {
-          controller.skipPlanning(currentPlayer);
-          selectedCardIndex = -1;
-          spawnCount = 0;
-        });
-      } else {
-        ctx.fillStyle = COLORS.text;
-        ctx.font = "bold 14px monospace";
-        ctx.textAlign = "left";
-        ctx.fillText(
-          `${currentPlayer === "PLAYER_1" ? "Player 1" : "Player 2"}'s Cards:`,
-          50,
-          290
-        );
-        renderCardHand(hand, 50, 300, W - 100);
-        const maxSpawns = controller.getMaxSpawns(currentPlayer);
-        renderSpawnControls(50, 480, maxSpawns, player.gold);
-        if (selectedCardIndex >= 0) {
-          addButton(W / 2 - 80, 550, 160, 40, "Confirm", () => {
-            const card = hand[selectedCardIndex];
-            controller.submitPlanning(currentPlayer, card.cardId, spawnCount);
-            selectedCardIndex = -1;
-            spawnCount = 0;
-          });
-        }
+  function drawEnergyPips(ctx2, x, y, current, max, size = 6) {
+    for (let i = 0; i < max; i++) {
+      const px = x + i * (size + 3);
+      ctx2.beginPath();
+      ctx2.moveTo(px + size / 2, y);
+      ctx2.lineTo(px + size, y + size / 2);
+      ctx2.lineTo(px + size / 2, y + size);
+      ctx2.lineTo(px, y + size / 2);
+      ctx2.closePath();
+      if (i < current) {
+        ctx2.fillStyle = COLORS.energy;
+        ctx2.fill();
       }
-    } else if (ui.phase === "GAME_OVER") {
-      ctx.fillStyle = COLORS.gold;
-      ctx.font = "bold 24px monospace";
-      ctx.textAlign = "center";
-      ctx.fillText(ui.message, W / 2, 350);
-      addButton(W / 2 - 80, 390, 160, 40, "Play Again", () => {
-        controller.restart();
-        selectedCardIndex = -1;
-        spawnCount = 0;
-      });
-    }
-    for (const btn of buttons) {
-      renderButton(btn);
+      ctx2.strokeStyle = i < current ? "#2080b0" : "#333";
+      ctx2.lineWidth = 1;
+      ctx2.stroke();
     }
   }
-  function renderPlayerStats(gs, playerId, x, y, w) {
-    const idx = playerId === "PLAYER_1" ? 0 : 1;
-    const player = gs.players[idx];
-    const champ = player.champions[0];
-    const color = playerId === "PLAYER_1" ? COLORS.accent1 : COLORS.accent2;
-    ctx.fillStyle = COLORS.panel;
-    ctx.fillRect(x, y, w, 60);
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.strokeRect(x, y, w, 60);
-    ctx.fillStyle = color;
-    ctx.font = "bold 14px monospace";
-    ctx.textAlign = "left";
-    ctx.fillText(playerId === "PLAYER_1" ? "PLAYER 1" : "PLAYER 2", x + 10, y + 20);
-    ctx.fillStyle = COLORS.text;
-    ctx.font = "12px monospace";
-    if (champ) {
-      const hpPct = champ.currentHp / champ.maxHp;
-      const hpColor = hpPct > 0.5 ? COLORS.green : hpPct > 0.25 ? COLORS.gold : COLORS.red;
-      ctx.fillText(`${champ.name} Lv${champ.level}`, x + 10, y + 38);
-      const barX = x + 140;
-      const barW = 100;
-      ctx.fillStyle = "#333";
-      ctx.fillRect(barX, y + 28, barW, 12);
-      ctx.fillStyle = hpColor;
-      ctx.fillRect(barX, y + 28, barW * hpPct, 12);
-      ctx.fillStyle = COLORS.text;
-      ctx.font = "10px monospace";
-      ctx.textAlign = "center";
-      ctx.fillText(`${champ.currentHp}/${champ.maxHp}`, barX + barW / 2, y + 38);
-      ctx.textAlign = "left";
-      ctx.fillStyle = "#5dade2";
-      ctx.fillText(`E:${champ.currentEnergy}`, barX + barW + 10, y + 38);
-      if (!champ.isAlive) {
-        ctx.fillStyle = COLORS.red;
-        ctx.font = "bold 12px monospace";
-        ctx.fillText("DEAD", barX + barW + 40, y + 38);
-      }
+  function drawGoldIcon(ctx2, x, y, radius = 7) {
+    ctx2.beginPath();
+    ctx2.arc(x, y, radius, 0, Math.PI * 2);
+    ctx2.fillStyle = COLORS.gold;
+    ctx2.fill();
+    ctx2.strokeStyle = "#b08a10";
+    ctx2.lineWidth = 1;
+    ctx2.stroke();
+    ctx2.fillStyle = "#806008";
+    ctx2.font = `bold ${radius}px 'Segoe UI', Arial, sans-serif`;
+    ctx2.textAlign = "center";
+    ctx2.textBaseline = "middle";
+    ctx2.fillText("G", x, y + 1);
+  }
+  function drawHexagon(ctx2, cx, cy, radius) {
+    ctx2.beginPath();
+    for (let i = 0; i < 6; i++) {
+      const angle = Math.PI / 6 + i * Math.PI / 3;
+      const hx = cx + radius * Math.cos(angle);
+      const hy = cy + radius * Math.sin(angle);
+      if (i === 0) ctx2.moveTo(hx, hy);
+      else ctx2.lineTo(hx, hy);
     }
-    ctx.fillStyle = COLORS.gold;
-    ctx.font = "bold 14px monospace";
-    ctx.textAlign = "right";
-    ctx.fillText(`${player.gold}g`, x + w - 10, y + 20);
-    ctx.fillStyle = COLORS.textDim;
-    ctx.font = "11px monospace";
-    ctx.fillText(`Hand: ${player.hand.length}`, x + w - 10, y + 38);
-    ctx.textAlign = "left";
+    ctx2.closePath();
   }
-  function renderLane(lane, x, y, w, h) {
-    const zoneW = w / LANE_ZONE_COUNT;
-    ctx.fillStyle = COLORS.lane;
-    ctx.fillRect(x, y, w, h);
-    for (let i = 0; i < LANE_ZONE_COUNT; i++) {
-      const zx = x + i * zoneW;
-      const zone = lane.zones[i];
-      if (i === lane.frontlinePosition) {
-        ctx.fillStyle = COLORS.zoneFront;
-      } else {
-        ctx.fillStyle = COLORS.zone;
-      }
-      ctx.fillRect(zx + 1, y + 1, zoneW - 2, h - 2);
-      ctx.fillStyle = COLORS.textDim;
-      ctx.font = "10px monospace";
-      ctx.textAlign = "center";
-      ctx.fillText(`Z${i}`, zx + zoneW / 2, y + 12);
-      const p1m = zone.minions.player1.count;
-      const p2m = zone.minions.player2.count;
-      if (p1m > 0 || p2m > 0) {
-        ctx.font = "11px monospace";
-        if (p1m > 0) {
-          ctx.fillStyle = COLORS.accent1;
-          ctx.fillText(`${p1m}`, zx + zoneW / 2 - 12, y + h / 2 + 4);
-        }
-        if (p2m > 0) {
-          ctx.fillStyle = COLORS.accent2;
-          ctx.fillText(`${p2m}`, zx + zoneW / 2 + 12, y + h / 2 + 4);
-        }
-      }
-      if (zone.championsPresent.includes("PLAYER_1")) {
-        ctx.fillStyle = COLORS.accent1;
-        ctx.beginPath();
-        ctx.arc(zx + zoneW / 2 - 12, y + h - 14, 5, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      if (zone.championsPresent.includes("PLAYER_2")) {
-        ctx.fillStyle = COLORS.accent2;
-        ctx.beginPath();
-        ctx.arc(zx + zoneW / 2 + 12, y + h - 14, 5, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      if (i === 0) {
-        ctx.fillStyle = COLORS.base;
-        ctx.font = "bold 10px monospace";
-        ctx.fillText(`B:${lane.baseHp.player1}`, zx + zoneW / 2, y + h - 4);
-      }
-      if (i === 1) {
-        ctx.fillStyle = COLORS.tower;
-        ctx.font = "bold 10px monospace";
-        ctx.fillText(`T:${lane.towerHp.player1}`, zx + zoneW / 2, y + h - 4);
-      }
-      if (i === LANE_ZONE_COUNT - 2) {
-        ctx.fillStyle = COLORS.tower;
-        ctx.font = "bold 10px monospace";
-        ctx.fillText(`T:${lane.towerHp.player2}`, zx + zoneW / 2, y + h - 4);
-      }
-      if (i === LANE_ZONE_COUNT - 1) {
-        ctx.fillStyle = COLORS.base;
-        ctx.font = "bold 10px monospace";
-        ctx.fillText(`B:${lane.baseHp.player2}`, zx + zoneW / 2, y + h - 4);
-      }
-      if (i === lane.frontlinePosition) {
-        ctx.strokeStyle = COLORS.gold;
-        ctx.lineWidth = 2;
-        ctx.strokeRect(zx + 1, y + 1, zoneW - 2, h - 2);
-      }
-    }
-    ctx.fillStyle = COLORS.accent1;
-    ctx.font = "bold 11px monospace";
-    ctx.textAlign = "left";
-    ctx.fillText("P1 Base <", x, y + h + 14);
-    ctx.fillStyle = COLORS.accent2;
-    ctx.textAlign = "right";
-    ctx.fillText("> P2 Base", x + w, y + h + 14);
+  function hexToPixel(q, r, radius, originX, originY) {
+    const xSpacing = radius * Math.sqrt(3);
+    const ySpacing = radius * 1.5;
+    const x = originX + q * xSpacing + r % 2 * (xSpacing / 2);
+    const y = originY + r * ySpacing;
+    return { x, y };
   }
-  function renderCardHand(hand, x, y, totalW) {
-    const cardW = Math.min(150, (totalW - 20) / Math.max(hand.length, 1));
-    const cardH = 140;
-    const gap = 8;
-    hand.forEach((card, i) => {
-      const cx = x + i * (cardW + gap);
-      const isSelected = i === selectedCardIndex;
-      ctx.fillStyle = isSelected ? COLORS.cardSelected : COLORS.card;
-      ctx.fillRect(cx, y, cardW, cardH);
-      ctx.strokeStyle = isSelected ? COLORS.green : stanceColor(card.stance);
-      ctx.lineWidth = isSelected ? 3 : 1;
-      ctx.strokeRect(cx, y, cardW, cardH);
-      ctx.fillStyle = stanceColor(card.stance);
-      ctx.fillRect(cx, y, cardW, 22);
-      ctx.fillStyle = "#fff";
-      ctx.font = "bold 11px monospace";
-      ctx.textAlign = "center";
-      ctx.fillText(card.stance, cx + cardW / 2, y + 15);
-      ctx.fillStyle = COLORS.text;
-      ctx.font = "bold 12px monospace";
-      ctx.textAlign = "center";
-      const nameLines = wordWrap(card.name, Math.floor(cardW / 7));
-      nameLines.forEach((line, li) => {
-        ctx.fillText(line, cx + cardW / 2, y + 42 + li * 14);
-      });
-      ctx.fillStyle = COLORS.textDim;
-      ctx.font = "10px monospace";
-      if (card.effects.length > 0) {
-        card.effects.forEach((eff, ei) => {
-          const label = eff.type.replace(/_/g, " ").toLowerCase();
-          ctx.fillText(`+${eff.value} ${label}`, cx + cardW / 2, y + 80 + ei * 14);
-        });
-      } else {
-        ctx.fillText("(no bonus)", cx + cardW / 2, y + 80);
-      }
-      ctx.fillStyle = COLORS.textDim;
-      ctx.font = "9px monospace";
-      ctx.fillText(`[${i + 1}]`, cx + cardW / 2, y + cardH - 6);
-      addButton(cx, y, cardW, cardH, "", () => {
-        selectedCardIndex = i;
-        spawnCount = 0;
-      });
-    });
+  function drawPanel(ctx2, x, y, w, h, borderColor = COLORS.panelBorder, r = 6) {
+    const grad = ctx2.createLinearGradient(x, y, x, y + h);
+    grad.addColorStop(0, COLORS.panel);
+    grad.addColorStop(1, "#080810");
+    roundRect(ctx2, x, y, w, h, r);
+    ctx2.fillStyle = grad;
+    ctx2.fill();
+    ctx2.strokeStyle = borderColor;
+    ctx2.lineWidth = 1;
+    roundRect(ctx2, x, y, w, h, r);
+    ctx2.stroke();
   }
-  function renderSpawnControls(x, y, maxSpawns, gold) {
-    ctx.fillStyle = COLORS.text;
-    ctx.font = "bold 13px monospace";
-    ctx.textAlign = "left";
-    ctx.fillText(`Spawn Minions: ${spawnCount}  (cost: ${spawnCount * MINION_SPAWN_COST}g)`, x, y);
-    addButton(x + 280, y - 14, 30, 22, "-", () => {
-      if (spawnCount > 0) spawnCount--;
-    });
-    addButton(x + 318, y - 14, 30, 22, "+", () => {
-      if (spawnCount < maxSpawns) spawnCount++;
-    });
-    ctx.fillStyle = COLORS.textDim;
-    ctx.font = "11px monospace";
-    ctx.fillText(`(max ${maxSpawns}, ${MINION_SPAWN_COST}g each)`, x + 360, y);
-  }
-  function addButton(x, y, w, h, label, action) {
-    buttons.push({ x, y, w, h, label, action });
-  }
-  function renderButton(btn) {
-    if (!btn.label) return;
-    ctx.fillStyle = COLORS.button;
-    ctx.fillRect(btn.x, btn.y, btn.w, btn.h);
-    ctx.strokeStyle = "#1a8a4a";
-    ctx.lineWidth = 1;
-    ctx.strokeRect(btn.x, btn.y, btn.w, btn.h);
-    ctx.fillStyle = "#fff";
-    ctx.font = "bold 14px monospace";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText(btn.label, btn.x + btn.w / 2, btn.y + btn.h / 2);
-    ctx.textBaseline = "alphabetic";
+  function drawVignette(ctx2, x, y, w, h) {
+    const cx = x + w / 2;
+    const cy = y + h / 2;
+    const radius = Math.max(w, h) * 0.7;
+    const grad = ctx2.createRadialGradient(cx, cy, radius * 0.4, cx, cy, radius);
+    grad.addColorStop(0, "rgba(0,0,0,0)");
+    grad.addColorStop(1, "rgba(0,0,0,0.5)");
+    ctx2.fillStyle = grad;
+    ctx2.fillRect(x, y, w, h);
   }
   function wordWrap(text, maxLen) {
     const words = text.split(" ");
@@ -1961,6 +1886,1392 @@
     }
     if (current) lines.push(current);
     return lines;
+  }
+  function drawTree(ctx2, x, y, size) {
+    ctx2.fillStyle = COLORS.treeTrunk;
+    ctx2.fillRect(x - size * 0.1, y, size * 0.2, size * 0.4);
+    ctx2.beginPath();
+    ctx2.arc(x, y - size * 0.1, size * 0.4, 0, Math.PI * 2);
+    ctx2.fillStyle = COLORS.treeDark;
+    ctx2.fill();
+    ctx2.beginPath();
+    ctx2.arc(x - size * 0.1, y - size * 0.2, size * 0.28, 0, Math.PI * 2);
+    ctx2.fillStyle = COLORS.treeLight;
+    ctx2.fill();
+  }
+
+  // src/web/utils/animation.ts
+  function easeOutCubic(t) {
+    return 1 - Math.pow(1 - t, 3);
+  }
+  function easeOutQuad(t) {
+    return 1 - (1 - t) * (1 - t);
+  }
+  function clamp01(t) {
+    return Math.max(0, Math.min(1, t));
+  }
+  var activeFloats = [];
+  function renderFloatingTexts(ctx2, now) {
+    for (let i = activeFloats.length - 1; i >= 0; i--) {
+      const ft = activeFloats[i];
+      const elapsed = now - ft.startTime;
+      const t = elapsed / ft.duration;
+      if (t >= 1) {
+        activeFloats.splice(i, 1);
+        continue;
+      }
+      const alpha = 1 - easeOutQuad(t);
+      const yOffset = -30 * easeOutQuad(t);
+      ctx2.save();
+      ctx2.globalAlpha = alpha;
+      ctx2.fillStyle = ft.color;
+      ctx2.font = "bold 16px 'Segoe UI', Arial, sans-serif";
+      ctx2.textAlign = "center";
+      ctx2.textBaseline = "middle";
+      ctx2.fillText(ft.text, ft.x, ft.y + yOffset);
+      ctx2.restore();
+    }
+  }
+  function createTransition(mode, now, duration, focusX, focusY) {
+    return { mode, startTime: now, duration, focusX, focusY };
+  }
+  function getTransitionProgress(trans, now) {
+    const elapsed = now - trans.startTime;
+    return clamp01(elapsed / trans.duration);
+  }
+
+  // src/web/renderers/strategic-map.ts
+  function seededRandom(seed) {
+    const x = Math.sin(seed * 12.9898 + seed * 78.233) * 43758.5453;
+    return x - Math.floor(x);
+  }
+  function getLanePathPoints(x, y, w, h) {
+    const midY = y + h / 2;
+    const points = [];
+    const segments = 20;
+    for (let i = 0; i <= segments; i++) {
+      const t = i / segments;
+      const px = x + t * w;
+      const wave = Math.sin(t * Math.PI * 2) * (h * 0.08);
+      const py = midY + wave;
+      points.push({ x: px, y: py });
+    }
+    return points;
+  }
+  function getZoneCenterOnPath(zoneIndex, x, y, w, h) {
+    const t = (zoneIndex + 0.5) / LANE_ZONE_COUNT;
+    const midY = y + h / 2;
+    const wave = Math.sin(t * Math.PI * 2) * (h * 0.08);
+    return { x: x + t * w, y: midY + wave };
+  }
+  function renderStrategicMap(ctx2, lane, players, area, time) {
+    const { x, y, w, h } = area;
+    ctx2.save();
+    ctx2.beginPath();
+    ctx2.rect(x, y, w, h);
+    ctx2.clip();
+    drawGround(ctx2, x, y, w, h);
+    drawVegetation(ctx2, x, y, w, h);
+    drawLanePath(ctx2, x, y, w, h);
+    drawFrontlineRift(ctx2, lane.frontlinePosition, x, y, w, h, time);
+    drawStructures(ctx2, lane, x, y, w, h);
+    drawMinions(ctx2, lane, x, y, w, h);
+    drawChampions(ctx2, lane, players, x, y, w, h);
+    drawVignette(ctx2, x, y, w, h);
+    ctx2.restore();
+  }
+  function drawGround(ctx2, x, y, w, h) {
+    const grad = ctx2.createLinearGradient(x, y, x + w, y);
+    grad.addColorStop(0, COLORS.mapGrassP1);
+    grad.addColorStop(0.35, COLORS.mapGrassP1);
+    grad.addColorStop(0.45, COLORS.mapGrassCenter);
+    grad.addColorStop(0.55, COLORS.mapGrassCenter);
+    grad.addColorStop(0.65, COLORS.mapGrassP2);
+    grad.addColorStop(1, COLORS.mapGrassP2);
+    ctx2.fillStyle = grad;
+    ctx2.fillRect(x, y, w, h);
+    ctx2.fillStyle = "rgba(0,0,0,0.08)";
+    for (let i = 0; i < 200; i++) {
+      const dx = seededRandom(i * 3) * w;
+      const dy = seededRandom(i * 3 + 1) * h;
+      const r = seededRandom(i * 3 + 2) * 3 + 1;
+      ctx2.beginPath();
+      ctx2.arc(x + dx, y + dy, r, 0, Math.PI * 2);
+      ctx2.fill();
+    }
+  }
+  function drawVegetation(ctx2, x, y, w, h) {
+    const midY = y + h / 2;
+    for (let i = 0; i < 30; i++) {
+      const tx = x + seededRandom(i * 7 + 100) * w;
+      const rawY = seededRandom(i * 7 + 101) * h;
+      let ty = y + rawY;
+      const distFromCenter = Math.abs(ty - midY);
+      if (distFromCenter < h * 0.2) {
+        ty = ty < midY ? midY - h * 0.2 : midY + h * 0.2;
+      }
+      const size = 8 + seededRandom(i * 7 + 102) * 10;
+      drawTree(ctx2, tx, ty, size);
+    }
+  }
+  function drawLanePath(ctx2, x, y, w, h) {
+    const points = getLanePathPoints(x, y, w, h);
+    ctx2.beginPath();
+    ctx2.moveTo(points[0].x, points[0].y);
+    for (let i = 1; i < points.length; i++) {
+      ctx2.lineTo(points[i].x, points[i].y);
+    }
+    ctx2.strokeStyle = COLORS.lanePathEdge;
+    ctx2.lineWidth = 48;
+    ctx2.lineCap = "round";
+    ctx2.lineJoin = "round";
+    ctx2.stroke();
+    ctx2.beginPath();
+    ctx2.moveTo(points[0].x, points[0].y);
+    for (let i = 1; i < points.length; i++) {
+      ctx2.lineTo(points[i].x, points[i].y);
+    }
+    ctx2.strokeStyle = COLORS.lanePath;
+    ctx2.lineWidth = 36;
+    ctx2.stroke();
+    ctx2.beginPath();
+    ctx2.moveTo(points[0].x, points[0].y);
+    for (let i = 1; i < points.length; i++) {
+      ctx2.lineTo(points[i].x, points[i].y);
+    }
+    ctx2.strokeStyle = "rgba(255,255,255,0.04)";
+    ctx2.lineWidth = 2;
+    ctx2.stroke();
+  }
+  function drawFrontlineRift(ctx2, frontline, x, y, w, h, time) {
+    const center = getZoneCenterOnPath(frontline, x, y, w, h);
+    const pulse = Math.sin(time * 3e-3) * 0.3 + 0.7;
+    const riftH = h * 0.5;
+    const grad = ctx2.createLinearGradient(center.x, center.y - riftH / 2, center.x, center.y + riftH / 2);
+    grad.addColorStop(0, "rgba(45, 212, 191, 0)");
+    grad.addColorStop(0.3, `rgba(45, 212, 191, ${0.4 * pulse})`);
+    grad.addColorStop(0.5, `rgba(45, 212, 191, ${0.8 * pulse})`);
+    grad.addColorStop(0.7, `rgba(45, 212, 191, ${0.4 * pulse})`);
+    grad.addColorStop(1, "rgba(45, 212, 191, 0)");
+    ctx2.save();
+    ctx2.shadowBlur = 20;
+    ctx2.shadowColor = COLORS.riftLight;
+    ctx2.beginPath();
+    ctx2.moveTo(center.x, center.y - riftH / 2);
+    ctx2.lineTo(center.x, center.y + riftH / 2);
+    ctx2.strokeStyle = grad;
+    ctx2.lineWidth = 6;
+    ctx2.stroke();
+    ctx2.restore();
+    drawCrossedSwords(ctx2, center.x, center.y, 10);
+  }
+  function drawCrossedSwords(ctx2, x, y, size) {
+    ctx2.save();
+    ctx2.strokeStyle = COLORS.textGold;
+    ctx2.lineWidth = 2;
+    ctx2.lineCap = "round";
+    ctx2.beginPath();
+    ctx2.moveTo(x - size, y - size);
+    ctx2.lineTo(x + size, y + size);
+    ctx2.stroke();
+    ctx2.beginPath();
+    ctx2.moveTo(x + size, y - size);
+    ctx2.lineTo(x - size, y + size);
+    ctx2.stroke();
+    ctx2.beginPath();
+    ctx2.moveTo(x - size * 0.3, y - size * 0.5);
+    ctx2.lineTo(x + size * 0.3, y - size * 0.9);
+    ctx2.stroke();
+    ctx2.beginPath();
+    ctx2.moveTo(x - size * 0.3, y - size * 0.9);
+    ctx2.lineTo(x + size * 0.3, y - size * 0.5);
+    ctx2.stroke();
+    ctx2.restore();
+  }
+  function drawStructures(ctx2, lane, x, y, w, h) {
+    const p1Base = getZoneCenterOnPath(0, x, y, w, h);
+    drawBase(ctx2, p1Base.x, p1Base.y, "PLAYER_1", lane.baseHp.player1, BASE_HP);
+    const p1Tower = getZoneCenterOnPath(1, x, y, w, h);
+    drawTower(ctx2, p1Tower.x, p1Tower.y, "PLAYER_1", lane.towerHp.player1, TOWER_HP);
+    const p2Tower = getZoneCenterOnPath(LANE_ZONE_COUNT - 2, x, y, w, h);
+    drawTower(ctx2, p2Tower.x, p2Tower.y, "PLAYER_2", lane.towerHp.player2, TOWER_HP);
+    const p2Base = getZoneCenterOnPath(LANE_ZONE_COUNT - 1, x, y, w, h);
+    drawBase(ctx2, p2Base.x, p2Base.y, "PLAYER_2", lane.baseHp.player2, BASE_HP);
+  }
+  function drawBase(ctx2, cx, cy, playerId, hp, maxHp) {
+    const size = 28;
+    const color = playerColorDark(playerId);
+    const lightColor = playerColor(playerId);
+    if (hp <= 0) {
+      drawRubble(ctx2, cx, cy, size);
+      return;
+    }
+    ctx2.save();
+    ctx2.shadowBlur = 15;
+    ctx2.shadowColor = lightColor;
+    ctx2.beginPath();
+    for (let i = 0; i < 6; i++) {
+      const angle = i * Math.PI / 3 - Math.PI / 6;
+      const hx = cx + size * Math.cos(angle);
+      const hy = cy + size * Math.sin(angle);
+      if (i === 0) ctx2.moveTo(hx, hy);
+      else ctx2.lineTo(hx, hy);
+    }
+    ctx2.closePath();
+    ctx2.fillStyle = color;
+    ctx2.fill();
+    ctx2.strokeStyle = lightColor;
+    ctx2.lineWidth = 2;
+    ctx2.stroke();
+    ctx2.beginPath();
+    for (let i = 0; i < 6; i++) {
+      const angle = i * Math.PI / 3 - Math.PI / 6;
+      const hx = cx + size * 0.55 * Math.cos(angle);
+      const hy = cy + size * 0.55 * Math.sin(angle);
+      if (i === 0) ctx2.moveTo(hx, hy);
+      else ctx2.lineTo(hx, hy);
+    }
+    ctx2.closePath();
+    ctx2.fillStyle = lightColor;
+    ctx2.globalAlpha = 0.3;
+    ctx2.fill();
+    ctx2.globalAlpha = 1;
+    if (hp < maxHp) {
+      const dmgPct = 1 - hp / maxHp;
+      drawCracks(ctx2, cx, cy, size, dmgPct);
+    }
+    ctx2.restore();
+    drawHpBar(ctx2, cx - 22, cy + size + 4, 44, 6, hp, maxHp, false);
+    ctx2.fillStyle = COLORS.textDim;
+    ctx2.font = FONT.tiny;
+    ctx2.textAlign = "center";
+    ctx2.textBaseline = "top";
+    ctx2.fillText("BASE", cx, cy + size + 13);
+  }
+  function drawTower(ctx2, cx, cy, playerId, hp, maxHp) {
+    const crystalColor = playerId === "PLAYER_1" ? COLORS.towerCrystalP1 : COLORS.towerCrystalP2;
+    if (hp <= 0) {
+      drawRubble(ctx2, cx, cy, 16);
+      return;
+    }
+    ctx2.save();
+    ctx2.beginPath();
+    ctx2.arc(cx, cy + 8, 14, 0, Math.PI * 2);
+    ctx2.fillStyle = COLORS.towerStone;
+    ctx2.fill();
+    ctx2.strokeStyle = "#6a5a40";
+    ctx2.lineWidth = 2;
+    ctx2.stroke();
+    ctx2.beginPath();
+    ctx2.moveTo(cx - 8, cy + 8);
+    ctx2.lineTo(cx - 5, cy - 14);
+    ctx2.lineTo(cx + 5, cy - 14);
+    ctx2.lineTo(cx + 8, cy + 8);
+    ctx2.closePath();
+    ctx2.fillStyle = "#7a6a50";
+    ctx2.fill();
+    ctx2.strokeStyle = "#5a4a30";
+    ctx2.lineWidth = 1;
+    ctx2.stroke();
+    ctx2.shadowBlur = 12;
+    ctx2.shadowColor = crystalColor;
+    ctx2.beginPath();
+    ctx2.arc(cx, cy - 16, 6, 0, Math.PI * 2);
+    const crystalGrad = ctx2.createRadialGradient(cx, cy - 16, 0, cx, cy - 16, 6);
+    crystalGrad.addColorStop(0, "#fff");
+    crystalGrad.addColorStop(0.5, crystalColor);
+    crystalGrad.addColorStop(1, playerColorDark(playerId));
+    ctx2.fillStyle = crystalGrad;
+    ctx2.fill();
+    if (hp < maxHp) {
+      ctx2.shadowBlur = 0;
+      drawCracks(ctx2, cx, cy, 14, 1 - hp / maxHp);
+    }
+    ctx2.restore();
+    drawHpBar(ctx2, cx - 18, cy + 24, 36, 5, hp, maxHp, false);
+  }
+  function drawRubble(ctx2, cx, cy, size) {
+    ctx2.fillStyle = COLORS.rubble;
+    for (let i = 0; i < 5; i++) {
+      const rx = cx + (seededRandom(i * 13 + cx) - 0.5) * size * 1.2;
+      const ry = cy + (seededRandom(i * 13 + cy) - 0.5) * size * 0.8;
+      const rs = 2 + seededRandom(i * 13 + 50) * 4;
+      ctx2.beginPath();
+      ctx2.moveTo(rx, ry - rs);
+      ctx2.lineTo(rx + rs, ry + rs * 0.5);
+      ctx2.lineTo(rx - rs, ry + rs * 0.5);
+      ctx2.closePath();
+      ctx2.fill();
+    }
+  }
+  function drawCracks(ctx2, cx, cy, size, severity) {
+    const numCracks = Math.floor(severity * 4) + 1;
+    ctx2.strokeStyle = "rgba(0,0,0,0.6)";
+    ctx2.lineWidth = 1;
+    for (let i = 0; i < numCracks; i++) {
+      const angle = seededRandom(i * 31 + cx) * Math.PI * 2;
+      const len = size * (0.3 + severity * 0.5);
+      ctx2.beginPath();
+      ctx2.moveTo(cx, cy);
+      const midX = cx + Math.cos(angle) * len * 0.5 + (seededRandom(i * 37) - 0.5) * 6;
+      const midY = cy + Math.sin(angle) * len * 0.5 + (seededRandom(i * 41) - 0.5) * 6;
+      ctx2.lineTo(midX, midY);
+      ctx2.lineTo(cx + Math.cos(angle) * len, cy + Math.sin(angle) * len);
+      ctx2.stroke();
+    }
+  }
+  function drawMinions(ctx2, lane, x, y, w, h) {
+    for (let i = 0; i < LANE_ZONE_COUNT; i++) {
+      const zone = lane.zones[i];
+      const center = getZoneCenterOnPath(i, x, y, w, h);
+      if (zone.minions.player1.count > 0) {
+        drawMinionFormation(ctx2, center.x - 15, center.y - 18, "PLAYER_1", zone.minions.player1.count);
+      }
+      if (zone.minions.player2.count > 0) {
+        drawMinionFormation(ctx2, center.x + 15, center.y + 18, "PLAYER_2", zone.minions.player2.count);
+      }
+    }
+  }
+  function drawMinionFormation(ctx2, cx, cy, playerId, count) {
+    const color = playerColor(playerId);
+    const maxShow = 3;
+    const show = Math.min(count, maxShow);
+    const positions = [
+      { dx: 0, dy: 0 },
+      { dx: -5, dy: -5 },
+      { dx: 5, dy: -5 }
+    ];
+    for (let i = 0; i < show; i++) {
+      const px = cx + positions[i].dx;
+      const py = cy + positions[i].dy;
+      ctx2.beginPath();
+      ctx2.arc(px, py, 3.5, 0, Math.PI * 2);
+      ctx2.fillStyle = color;
+      ctx2.fill();
+      ctx2.strokeStyle = "rgba(0,0,0,0.5)";
+      ctx2.lineWidth = 1;
+      ctx2.stroke();
+    }
+    if (count > maxShow) {
+      ctx2.fillStyle = COLORS.textDim;
+      ctx2.font = FONT.tiny;
+      ctx2.textAlign = "left";
+      ctx2.textBaseline = "middle";
+      ctx2.fillText(`+${count - maxShow}`, cx + 10, cy);
+    }
+  }
+  function drawChampions(ctx2, lane, players, x, y, w, h) {
+    for (let pi = 0; pi < 2; pi++) {
+      const player = players[pi];
+      const playerId = player.playerId;
+      const champ = player.champions[0];
+      if (!champ) continue;
+      let champZone = -1;
+      for (let z = 0; z < LANE_ZONE_COUNT; z++) {
+        if (lane.zones[z].championsPresent.includes(playerId)) {
+          champZone = z;
+          break;
+        }
+      }
+      if (champZone < 0) continue;
+      const center = getZoneCenterOnPath(champZone, x, y, w, h);
+      const offsetY = pi === 0 ? -4 : 4;
+      const cx2 = center.x;
+      const cy2 = center.y + offsetY;
+      if (!champ.isAlive) {
+        drawDeadChampion(ctx2, cx2, cy2, playerId);
+        continue;
+      }
+      const color = playerColor(playerId);
+      const initial = champ.name.charAt(0).toUpperCase();
+      ctx2.save();
+      ctx2.beginPath();
+      ctx2.arc(cx2, cy2, 18, 0, Math.PI * 2);
+      ctx2.fillStyle = `${color}33`;
+      ctx2.fill();
+      ctx2.shadowBlur = 8;
+      ctx2.shadowColor = color;
+      ctx2.beginPath();
+      ctx2.arc(cx2, cy2, 12, 0, Math.PI * 2);
+      ctx2.fillStyle = color;
+      ctx2.fill();
+      ctx2.strokeStyle = "#fff";
+      ctx2.lineWidth = 2;
+      ctx2.stroke();
+      ctx2.shadowBlur = 0;
+      ctx2.fillStyle = "#fff";
+      ctx2.font = "bold 12px 'Segoe UI', Arial, sans-serif";
+      ctx2.textAlign = "center";
+      ctx2.textBaseline = "middle";
+      ctx2.fillText(initial, cx2, cy2);
+      ctx2.restore();
+      drawHpBar(ctx2, cx2 - 14, cy2 + 15, 28, 4, champ.currentHp, champ.maxHp, false);
+    }
+  }
+  function drawDeadChampion(ctx2, cx, cy, playerId) {
+    ctx2.save();
+    ctx2.globalAlpha = 0.4;
+    ctx2.beginPath();
+    ctx2.arc(cx, cy, 12, 0, Math.PI * 2);
+    ctx2.fillStyle = "#444";
+    ctx2.fill();
+    ctx2.strokeStyle = "#666";
+    ctx2.lineWidth = 1;
+    ctx2.stroke();
+    ctx2.strokeStyle = "#888";
+    ctx2.lineWidth = 2;
+    ctx2.beginPath();
+    ctx2.moveTo(cx - 5, cy - 5);
+    ctx2.lineTo(cx + 5, cy + 5);
+    ctx2.moveTo(cx + 5, cy - 5);
+    ctx2.lineTo(cx - 5, cy + 5);
+    ctx2.stroke();
+    ctx2.restore();
+  }
+
+  // src/web/renderers/hud.ts
+  function renderHUD(ctx2, gs, phase, area) {
+    const { x, y, w, h } = area;
+    renderPlayerPanel(ctx2, gs.players[0], x, y, w * 0.38, h);
+    renderTurnIndicator(ctx2, gs.turnNumber, phase, x + w * 0.38, y, w * 0.24, h);
+    renderPlayerPanel(ctx2, gs.players[1], x + w * 0.62, y, w * 0.38, h);
+  }
+  function renderPlayerPanel(ctx2, player, x, y, w, h) {
+    const color = playerColor(player.playerId);
+    const darkColor = playerColorDark(player.playerId);
+    drawPanel(ctx2, x, y, w, h, darkColor);
+    const champ = player.champions[0];
+    if (!champ) return;
+    const isP1 = player.playerId === "PLAYER_1";
+    const pad = 10;
+    const portraitR = 18;
+    const portraitX = isP1 ? x + pad + portraitR : x + w - pad - portraitR;
+    const portraitY = y + h / 2;
+    ctx2.beginPath();
+    ctx2.arc(portraitX, portraitY, portraitR, 0, Math.PI * 2);
+    ctx2.fillStyle = darkColor;
+    ctx2.fill();
+    ctx2.strokeStyle = color;
+    ctx2.lineWidth = 2;
+    ctx2.stroke();
+    drawRoleIcon(ctx2, portraitX, portraitY, champ.role, color);
+    const textX = isP1 ? portraitX + portraitR + 10 : x + pad;
+    const textEndX = isP1 ? x + w - pad : portraitX - portraitR - 10;
+    const textW = textEndX - textX;
+    ctx2.textAlign = isP1 ? "left" : "right";
+    const textAnchor = isP1 ? textX : textEndX;
+    ctx2.fillStyle = color;
+    ctx2.font = FONT.subtitle;
+    ctx2.textBaseline = "top";
+    ctx2.fillText(isP1 ? "PLAYER 1" : "PLAYER 2", textAnchor, y + 6);
+    ctx2.fillStyle = COLORS.text;
+    ctx2.font = FONT.body;
+    ctx2.fillText(`${champ.name} Lv${champ.level}`, textAnchor, y + 22);
+    if (!champ.isAlive) {
+      ctx2.fillStyle = COLORS.hpLow;
+      ctx2.font = FONT.smallBold;
+      ctx2.fillText("DEAD", textAnchor, y + 38);
+    } else {
+      const hpBarW = Math.min(textW, 120);
+      const hpBarX = isP1 ? textX : textEndX - hpBarW;
+      drawHpBar(ctx2, hpBarX, y + 38, hpBarW, 10, champ.currentHp, champ.maxHp);
+      const energyX = isP1 ? textX : textEndX - champ.maxEnergy * 9;
+      drawEnergyPips(ctx2, energyX, y + 52, champ.currentEnergy, champ.maxEnergy, 5);
+    }
+    const goldX = isP1 ? x + w - pad - 30 : x + pad + 10;
+    drawGoldIcon(ctx2, goldX, y + 14, 7);
+    ctx2.fillStyle = COLORS.textGold;
+    ctx2.font = FONT.bodyBold;
+    ctx2.textAlign = isP1 ? "left" : "right";
+    ctx2.fillText(`${player.gold}`, isP1 ? goldX + 12 : goldX - 12, y + 10);
+    ctx2.fillStyle = COLORS.textDim;
+    ctx2.font = FONT.small;
+    ctx2.fillText(`Cards: ${player.hand.length}`, isP1 ? goldX + 12 : goldX - 12, y + 26);
+    ctx2.textBaseline = "alphabetic";
+  }
+  function drawRoleIcon(ctx2, cx, cy, role, color) {
+    ctx2.save();
+    ctx2.fillStyle = color;
+    ctx2.strokeStyle = color;
+    ctx2.lineWidth = 1.5;
+    switch (role) {
+      case "TANK" /* Tank */:
+        ctx2.beginPath();
+        ctx2.moveTo(cx, cy - 10);
+        ctx2.lineTo(cx + 8, cy - 5);
+        ctx2.lineTo(cx + 8, cy + 3);
+        ctx2.lineTo(cx, cy + 10);
+        ctx2.lineTo(cx - 8, cy + 3);
+        ctx2.lineTo(cx - 8, cy - 5);
+        ctx2.closePath();
+        ctx2.stroke();
+        break;
+      case "MAGE" /* Mage */:
+        ctx2.beginPath();
+        ctx2.moveTo(cx, cy - 10);
+        ctx2.quadraticCurveTo(cx + 8, cy - 4, cx + 4, cy + 2);
+        ctx2.quadraticCurveTo(cx + 6, cy + 6, cx, cy + 10);
+        ctx2.quadraticCurveTo(cx - 6, cy + 6, cx - 4, cy + 2);
+        ctx2.quadraticCurveTo(cx - 8, cy - 4, cx, cy - 10);
+        ctx2.stroke();
+        break;
+      case "FIGHTER" /* Fighter */:
+        ctx2.beginPath();
+        ctx2.moveTo(cx, cy - 10);
+        ctx2.lineTo(cx, cy + 5);
+        ctx2.moveTo(cx - 6, cy - 3);
+        ctx2.lineTo(cx + 6, cy - 3);
+        ctx2.stroke();
+        break;
+      case "ASSASSIN" /* Assassin */:
+        ctx2.beginPath();
+        ctx2.moveTo(cx + 6, cy - 8);
+        ctx2.lineTo(cx - 6, cy + 8);
+        ctx2.moveTo(cx - 3, cy - 2);
+        ctx2.lineTo(cx + 3, cy + 2);
+        ctx2.stroke();
+        break;
+      case "SUPPORT" /* Support */:
+        ctx2.beginPath();
+        ctx2.moveTo(cx, cy - 8);
+        ctx2.lineTo(cx, cy + 8);
+        ctx2.moveTo(cx - 6, cy);
+        ctx2.lineTo(cx + 6, cy);
+        ctx2.stroke();
+        break;
+    }
+    ctx2.restore();
+  }
+  function renderTurnIndicator(ctx2, turn, phase, x, y, w, h) {
+    const cx = x + w / 2;
+    const cy = y + h / 2 - 4;
+    ctx2.strokeStyle = COLORS.textGold;
+    ctx2.lineWidth = 1;
+    ctx2.beginPath();
+    ctx2.moveTo(cx - 70, cy);
+    ctx2.lineTo(cx - 30, cy);
+    ctx2.stroke();
+    ctx2.beginPath();
+    ctx2.moveTo(cx + 30, cy);
+    ctx2.lineTo(cx + 70, cy);
+    ctx2.stroke();
+    const diamondSize = 3;
+    for (const dx of [-70, 70]) {
+      ctx2.fillStyle = COLORS.textGold;
+      ctx2.beginPath();
+      ctx2.moveTo(cx + dx, cy - diamondSize);
+      ctx2.lineTo(cx + dx + diamondSize, cy);
+      ctx2.lineTo(cx + dx, cy + diamondSize);
+      ctx2.lineTo(cx + dx - diamondSize, cy);
+      ctx2.closePath();
+      ctx2.fill();
+    }
+    ctx2.fillStyle = COLORS.textGold;
+    ctx2.font = FONT.title;
+    ctx2.textAlign = "center";
+    ctx2.textBaseline = "middle";
+    ctx2.fillText(`TURN ${turn}`, cx, cy);
+    const phaseLabel = phase === "P1_PLANNING" ? "Player 1 Planning" : phase === "P2_PLANNING" ? "Player 2 Planning" : phase === "BATTLE_REPLAY" ? "BATTLE" : phase === "GAME_OVER" ? "GAME OVER" : "Resolving...";
+    ctx2.fillStyle = COLORS.textDim;
+    ctx2.font = FONT.small;
+    ctx2.fillText(phaseLabel, cx, cy + 18);
+    ctx2.textBaseline = "alphabetic";
+  }
+  function renderMessageBar(ctx2, message, x, y, w, h) {
+    ctx2.fillStyle = "rgba(0,0,0,0.3)";
+    ctx2.fillRect(x, y, w, h);
+    ctx2.fillStyle = COLORS.textGold;
+    ctx2.font = FONT.body;
+    ctx2.textAlign = "center";
+    ctx2.textBaseline = "middle";
+    const lines = wordWrap(message, Math.floor(w / 8));
+    const lineH = 16;
+    const startY = y + h / 2 - (lines.length - 1) * lineH / 2;
+    lines.forEach((line, i) => {
+      ctx2.fillText(line, x + w / 2, startY + i * lineH);
+    });
+    ctx2.textBaseline = "alphabetic";
+  }
+
+  // src/web/renderers/card-hand.ts
+  function renderCardHand(ctx2, hand, selectedIndex, area, onSelect) {
+    const { x, y, w, h } = area;
+    const buttons2 = [];
+    const cardW = 130;
+    const cardH = Math.min(h - 10, 170);
+    const gap = 10;
+    const totalCardsW = hand.length * cardW + (hand.length - 1) * gap;
+    const startX = x + (w - totalCardsW) / 2;
+    const cardY = y + 5;
+    hand.forEach((card, i) => {
+      const cx = startX + i * (cardW + gap);
+      const isSelected = i === selectedIndex;
+      renderCard(ctx2, card, cx, cardY, cardW, cardH, isSelected, i);
+      buttons2.push({
+        x: cx,
+        y: cardY,
+        w: cardW,
+        h: cardH,
+        label: "",
+        action: () => onSelect(i)
+      });
+    });
+    return buttons2;
+  }
+  function renderCard(ctx2, card, x, y, w, h, isSelected, index) {
+    const sColor = stanceColor(card.stance);
+    ctx2.save();
+    if (isSelected) {
+      ctx2.shadowBlur = 12;
+      ctx2.shadowColor = COLORS.cardSelectedBorder;
+    }
+    roundRect(ctx2, x, y, w, h, 8);
+    ctx2.fillStyle = isSelected ? COLORS.cardSelected : COLORS.cardBg;
+    ctx2.fill();
+    ctx2.strokeStyle = isSelected ? COLORS.cardSelectedBorder : COLORS.cardBorder;
+    ctx2.lineWidth = isSelected ? 2 : 1;
+    roundRect(ctx2, x, y, w, h, 8);
+    ctx2.stroke();
+    ctx2.shadowBlur = 0;
+    ctx2.save();
+    roundRect(ctx2, x, y, w, 24, 8);
+    ctx2.clip();
+    ctx2.fillRect(x, y + 12, w, 12);
+    const bannerGrad = ctx2.createLinearGradient(x, y, x, y + 24);
+    bannerGrad.addColorStop(0, sColor);
+    bannerGrad.addColorStop(1, adjustBrightness(sColor, -30));
+    ctx2.fillStyle = bannerGrad;
+    ctx2.fillRect(x, y, w, 24);
+    ctx2.restore();
+    ctx2.fillStyle = "#fff";
+    ctx2.font = FONT.smallBold;
+    ctx2.textAlign = "center";
+    ctx2.textBaseline = "middle";
+    ctx2.fillText(card.stance, x + w / 2, y + 12);
+    ctx2.fillStyle = COLORS.text;
+    ctx2.font = FONT.bodyBold;
+    ctx2.textBaseline = "top";
+    const nameLines = wrapText(card.name, Math.floor(w / 8));
+    nameLines.forEach((line, li) => {
+      ctx2.fillText(line, x + w / 2, y + 32 + li * 16);
+    });
+    ctx2.font = FONT.small;
+    const effectY = y + 32 + nameLines.length * 16 + 8;
+    if (card.effects.length > 0) {
+      card.effects.forEach((eff, ei) => {
+        const effectColor = getEffectColor(eff.type);
+        const label = formatEffectType(eff.type);
+        ctx2.fillStyle = effectColor;
+        ctx2.beginPath();
+        ctx2.arc(x + w / 2 - 40, effectY + ei * 18 + 5, 4, 0, Math.PI * 2);
+        ctx2.fill();
+        ctx2.fillStyle = COLORS.textDim;
+        ctx2.textAlign = "left";
+        ctx2.fillText(`+${eff.value} ${label}`, x + w / 2 - 32, effectY + ei * 18);
+      });
+    } else {
+      ctx2.fillStyle = COLORS.textDim;
+      ctx2.textAlign = "center";
+      ctx2.fillText("(no bonus)", x + w / 2, effectY);
+    }
+    ctx2.fillStyle = COLORS.textDim;
+    ctx2.font = FONT.tiny;
+    ctx2.textAlign = "center";
+    ctx2.fillText(`[${index + 1}]`, x + w / 2, y + h - 10);
+    ctx2.textBaseline = "alphabetic";
+    ctx2.restore();
+  }
+  function renderSpawnControls(ctx2, x, y, spawnCount2, maxSpawns, gold, onMinus, onPlus) {
+    const buttons2 = [];
+    ctx2.fillStyle = COLORS.text;
+    ctx2.font = FONT.bodyBold;
+    ctx2.textAlign = "left";
+    ctx2.textBaseline = "middle";
+    ctx2.fillText("Spawn Minions:", x, y + 12);
+    const silX = x + 120;
+    for (let i = 0; i < 3; i++) {
+      const sx = silX + i * 22;
+      const filled = i < spawnCount2;
+      ctx2.beginPath();
+      ctx2.arc(sx, y + 6, 5, 0, Math.PI * 2);
+      ctx2.fillStyle = filled ? COLORS.text : "transparent";
+      ctx2.fill();
+      ctx2.strokeStyle = filled ? COLORS.text : COLORS.textDim;
+      ctx2.lineWidth = 1;
+      ctx2.stroke();
+      ctx2.beginPath();
+      ctx2.moveTo(sx, y + 11);
+      ctx2.lineTo(sx, y + 18);
+      ctx2.strokeStyle = filled ? COLORS.text : COLORS.textDim;
+      ctx2.stroke();
+    }
+    const minusBtnX = silX + 80;
+    buttons2.push(renderSmallButton(ctx2, minusBtnX, y, 24, 24, "-", spawnCount2 > 0, onMinus));
+    ctx2.fillStyle = COLORS.text;
+    ctx2.font = FONT.bodyBold;
+    ctx2.textAlign = "center";
+    ctx2.fillText(`${spawnCount2}`, minusBtnX + 36, y + 12);
+    buttons2.push(renderSmallButton(ctx2, minusBtnX + 48, y, 24, 24, "+", spawnCount2 < maxSpawns, onPlus));
+    const costX = minusBtnX + 86;
+    drawGoldIcon(ctx2, costX, y + 12, 6);
+    ctx2.fillStyle = COLORS.textGold;
+    ctx2.font = FONT.small;
+    ctx2.textAlign = "left";
+    ctx2.fillText(`${spawnCount2 * MINION_SPAWN_COST}`, costX + 10, y + 12);
+    ctx2.fillStyle = COLORS.textDim;
+    ctx2.font = FONT.tiny;
+    ctx2.fillText(`(max ${maxSpawns})`, costX + 30, y + 12);
+    ctx2.textBaseline = "alphabetic";
+    return buttons2;
+  }
+  function renderSmallButton(ctx2, x, y, w, h, label, enabled, action) {
+    roundRect(ctx2, x, y, w, h, 4);
+    ctx2.fillStyle = enabled ? "#2a3a4a" : "#1a1a2a";
+    ctx2.fill();
+    ctx2.strokeStyle = enabled ? "#4a5a6a" : "#2a2a3a";
+    ctx2.lineWidth = 1;
+    roundRect(ctx2, x, y, w, h, 4);
+    ctx2.stroke();
+    ctx2.fillStyle = enabled ? COLORS.text : COLORS.textDim;
+    ctx2.font = FONT.bodyBold;
+    ctx2.textAlign = "center";
+    ctx2.textBaseline = "middle";
+    ctx2.fillText(label, x + w / 2, y + h / 2);
+    return { x, y, w, h, label, action: enabled ? action : () => {
+    } };
+  }
+  function renderActionButton(ctx2, x, y, w, h, label, action) {
+    ctx2.save();
+    ctx2.shadowBlur = 6;
+    ctx2.shadowColor = COLORS.button;
+    const grad = ctx2.createLinearGradient(x, y, x, y + h);
+    grad.addColorStop(0, "#3a8a4a");
+    grad.addColorStop(1, COLORS.button);
+    roundRect(ctx2, x, y, w, h, 6);
+    ctx2.fillStyle = grad;
+    ctx2.fill();
+    ctx2.strokeStyle = COLORS.buttonBorder;
+    ctx2.lineWidth = 1;
+    roundRect(ctx2, x, y, w, h, 6);
+    ctx2.stroke();
+    ctx2.shadowBlur = 0;
+    ctx2.fillStyle = COLORS.buttonText;
+    ctx2.font = FONT.subtitle;
+    ctx2.textAlign = "center";
+    ctx2.textBaseline = "middle";
+    ctx2.fillText(label, x + w / 2, y + h / 2);
+    ctx2.textBaseline = "alphabetic";
+    ctx2.restore();
+    return { x, y, w, h, label, action };
+  }
+  function wrapText(text, maxLen) {
+    const words = text.split(" ");
+    const lines = [];
+    let current = "";
+    for (const word of words) {
+      if (current.length + word.length + 1 > maxLen) {
+        lines.push(current);
+        current = word;
+      } else {
+        current = current ? current + " " + word : word;
+      }
+    }
+    if (current) lines.push(current);
+    return lines;
+  }
+  function getEffectColor(type) {
+    switch (type) {
+      case "BONUS_MINIONS":
+        return "#4a9a4a";
+      case "BONUS_GOLD":
+        return COLORS.textGold;
+      case "MINION_DAMAGE_BOOST":
+        return "#d04040";
+      case "TOWER_DAMAGE_REDUCTION":
+        return "#3080c0";
+      case "SCOUT_REVEAL":
+        return "#9060c0";
+      case "FORTIFY_MINIONS":
+        return "#40a0a0";
+      default:
+        return COLORS.textDim;
+    }
+  }
+  function formatEffectType(type) {
+    return type.replace(/_/g, " ").toLowerCase().replace(/\b\w/g, (c) => c);
+  }
+  function adjustBrightness(hex, amount) {
+    const r = Math.max(0, Math.min(255, parseInt(hex.slice(1, 3), 16) + amount));
+    const g = Math.max(0, Math.min(255, parseInt(hex.slice(3, 5), 16) + amount));
+    const b = Math.max(0, Math.min(255, parseInt(hex.slice(5, 7), 16) + amount));
+    return `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}`;
+  }
+
+  // src/web/renderers/battle-view.ts
+  var HEX_RADIUS = 36;
+  function renderBattleView(ctx2, frames, currentFrameIndex, area, time) {
+    const { x, y, w, h } = area;
+    const buttons2 = [];
+    const frame = frames[currentFrameIndex];
+    if (!frame) return buttons2;
+    const battle = frame.battleState;
+    ctx2.fillStyle = COLORS.bg;
+    ctx2.fillRect(x, y, w, h);
+    const gridW = BATTLE_GRID_WIDTH * HEX_RADIUS * Math.sqrt(3);
+    const gridH = BATTLE_GRID_HEIGHT * HEX_RADIUS * 1.5 + HEX_RADIUS * 0.5;
+    const originX = x + (w - gridW) / 2 + HEX_RADIUS * Math.sqrt(3) / 2;
+    const originY = y + 70 + HEX_RADIUS;
+    ctx2.fillStyle = "rgba(10, 10, 20, 0.7)";
+    roundRect(ctx2, originX - HEX_RADIUS, originY - HEX_RADIUS, gridW + HEX_RADIUS, gridH + HEX_RADIUS, 12);
+    ctx2.fill();
+    renderHexGrid(ctx2, battle, originX, originY, frame.action?.actorId ?? null, time);
+    renderBattleUnits(ctx2, battle, originX, originY, frame.action?.actorId ?? null, time);
+    if (frame.action) {
+      renderActionDescription(ctx2, frame.action.description, x, y + 10, w);
+    } else {
+      ctx2.fillStyle = COLORS.textGold;
+      ctx2.font = FONT.subtitle;
+      ctx2.textAlign = "center";
+      ctx2.fillText("Battle begins!", x + w / 2, y + 30);
+    }
+    ctx2.fillStyle = COLORS.textDim;
+    ctx2.font = FONT.small;
+    ctx2.textAlign = "left";
+    ctx2.fillText(`Round ${battle.roundNumber}`, x + 10, y + 20);
+    ctx2.fillStyle = COLORS.textDim;
+    ctx2.textAlign = "right";
+    ctx2.fillText(`${currentFrameIndex + 1}/${frames.length}`, x + w - 10, y + 20);
+    return buttons2;
+  }
+  function renderHexGrid(ctx2, battle, originX, originY, activeUnitId, time) {
+    for (let r = 0; r < BATTLE_GRID_HEIGHT; r++) {
+      for (let q = 0; q < BATTLE_GRID_WIDTH; q++) {
+        const key = `${q},${r}`;
+        const cell = battle.grid.cells.get(key);
+        if (!cell) continue;
+        const { x: hx, y: hy } = hexToPixel(q, r, HEX_RADIUS, originX, originY);
+        drawHexagon(ctx2, hx, hy, HEX_RADIUS - 1);
+        ctx2.fillStyle = getTerrainColor(cell.terrain);
+        ctx2.fill();
+        if (q <= 2) {
+          drawHexagon(ctx2, hx, hy, HEX_RADIUS - 1);
+          ctx2.fillStyle = COLORS.hexP1Tint;
+          ctx2.fill();
+        } else if (q >= 4) {
+          drawHexagon(ctx2, hx, hy, HEX_RADIUS - 1);
+          ctx2.fillStyle = COLORS.hexP2Tint;
+          ctx2.fill();
+        }
+        if (cell.occupantId && cell.occupantId === activeUnitId) {
+          const pulse = 0.3 + Math.sin(time * 5e-3) * 0.15;
+          drawHexagon(ctx2, hx, hy, HEX_RADIUS - 1);
+          ctx2.fillStyle = `rgba(240, 192, 32, ${pulse})`;
+          ctx2.fill();
+        }
+        drawHexagon(ctx2, hx, hy, HEX_RADIUS - 1);
+        ctx2.strokeStyle = COLORS.hexBorder;
+        ctx2.lineWidth = 1;
+        ctx2.stroke();
+        ctx2.fillStyle = "rgba(255,255,255,0.08)";
+        ctx2.font = FONT.tiny;
+        ctx2.textAlign = "center";
+        ctx2.textBaseline = "bottom";
+        ctx2.fillText(`${q},${r}`, hx, hy + HEX_RADIUS - 6);
+      }
+    }
+  }
+  function getTerrainColor(terrain) {
+    switch (terrain) {
+      case "OPEN" /* Open */:
+        return COLORS.hexBg;
+      case "BLOCKED" /* Blocked */:
+        return "#1a1a1a";
+      case "BUSH" /* Bush */:
+        return "#1a3a1a";
+      case "HIGH_GROUND" /* HighGround */:
+        return "#3a4a3a";
+    }
+  }
+  function renderBattleUnits(ctx2, battle, originX, originY, activeUnitId, time) {
+    for (const minion of battle.minions) {
+      if (!minion.isAlive) continue;
+      const { x: hx, y: hy } = hexToPixel(
+        minion.position.q,
+        minion.position.r,
+        HEX_RADIUS,
+        originX,
+        originY
+      );
+      renderBattleMinion(ctx2, minion, hx, hy, minion.minionId === activeUnitId, time);
+    }
+    for (const bc of battle.champions) {
+      if (!bc.championRef.isAlive) continue;
+      const pos = bc.championRef.battlePosition;
+      if (!pos) continue;
+      const { x: hx, y: hy } = hexToPixel(pos.q, pos.r, HEX_RADIUS, originX, originY);
+      renderBattleChampion(ctx2, bc, hx, hy, bc.championRef.championId === activeUnitId, time);
+    }
+  }
+  function renderBattleChampion(ctx2, bc, cx, cy, isActive, time) {
+    const champ = bc.championRef;
+    const color = playerColor(champ.ownerId);
+    const initial = champ.name.charAt(0).toUpperCase();
+    ctx2.save();
+    if (isActive) {
+      const pulse = 0.5 + Math.sin(time * 6e-3) * 0.3;
+      ctx2.beginPath();
+      ctx2.arc(cx, cy, 20, 0, Math.PI * 2);
+      ctx2.strokeStyle = `rgba(240, 192, 32, ${pulse})`;
+      ctx2.lineWidth = 2;
+      ctx2.stroke();
+    }
+    ctx2.shadowBlur = 8;
+    ctx2.shadowColor = color;
+    ctx2.beginPath();
+    ctx2.arc(cx, cy, 14, 0, Math.PI * 2);
+    ctx2.fillStyle = color;
+    ctx2.fill();
+    ctx2.strokeStyle = "#fff";
+    ctx2.lineWidth = 2;
+    ctx2.stroke();
+    ctx2.shadowBlur = 0;
+    ctx2.fillStyle = "#fff";
+    ctx2.font = "bold 14px 'Segoe UI', Arial, sans-serif";
+    ctx2.textAlign = "center";
+    ctx2.textBaseline = "middle";
+    ctx2.fillText(initial, cx, cy);
+    ctx2.restore();
+    drawHpBar(ctx2, cx - 16, cy + 17, 32, 5, champ.currentHp, champ.maxHp, false);
+    drawEnergyPips(ctx2, cx - champ.maxEnergy * 4, cy + 24, champ.currentEnergy, champ.maxEnergy, 4);
+    renderStatusIcons(ctx2, champ.statusEffects, cx + 16, cy - 16);
+  }
+  function renderBattleMinion(ctx2, minion, cx, cy, isActive, time) {
+    const color = playerColor(minion.ownerId);
+    if (isActive) {
+      ctx2.beginPath();
+      ctx2.arc(cx, cy, 12, 0, Math.PI * 2);
+      ctx2.strokeStyle = COLORS.hexHighlight;
+      ctx2.lineWidth = 1.5;
+      ctx2.stroke();
+    }
+    ctx2.beginPath();
+    ctx2.arc(cx, cy, 7, 0, Math.PI * 2);
+    ctx2.fillStyle = color;
+    ctx2.fill();
+    ctx2.strokeStyle = "rgba(255,255,255,0.5)";
+    ctx2.lineWidth = 1;
+    ctx2.stroke();
+    const hpPct = minion.maxHp > 0 ? minion.hp / minion.maxHp : 0;
+    const barW = 14;
+    ctx2.fillStyle = "#1a1a1a";
+    ctx2.fillRect(cx - barW / 2, cy + 9, barW, 2);
+    if (hpPct > 0) {
+      ctx2.fillStyle = hpPct > 0.5 ? COLORS.hpHigh : COLORS.hpLow;
+      ctx2.fillRect(cx - barW / 2, cy + 9, barW * hpPct, 2);
+    }
+  }
+  function renderStatusIcons(ctx2, effects, x, y) {
+    effects.forEach((eff, i) => {
+      const sx = x + i * 10;
+      let color;
+      switch (eff.type) {
+        case "STUN":
+          color = "#f0c020";
+          break;
+        case "SLOW":
+          color = "#6090d0";
+          break;
+        case "SHIELD":
+          color = COLORS.shield;
+          break;
+        case "BUFF_ATTACK":
+          color = "#d04040";
+          break;
+        case "DEBUFF_ARMOR":
+          color = "#804080";
+          break;
+        default:
+          color = COLORS.textDim;
+      }
+      ctx2.fillStyle = color;
+      ctx2.fillRect(sx, y, 7, 7);
+      ctx2.strokeStyle = "rgba(0,0,0,0.5)";
+      ctx2.lineWidth = 0.5;
+      ctx2.strokeRect(sx, y, 7, 7);
+    });
+  }
+  function renderActionDescription(ctx2, description, x, y, w) {
+    const textW = ctx2.measureText(description).width + 40;
+    const pillX = x + (w - textW) / 2;
+    ctx2.fillStyle = "rgba(0,0,0,0.6)";
+    roundRect(ctx2, pillX, y, textW, 26, 13);
+    ctx2.fill();
+    ctx2.fillStyle = COLORS.text;
+    ctx2.font = FONT.body;
+    ctx2.textAlign = "center";
+    ctx2.textBaseline = "middle";
+    ctx2.fillText(description, x + w / 2, y + 13);
+    ctx2.textBaseline = "alphabetic";
+  }
+  function renderBattleResult(ctx2, frames, area, onContinue) {
+    const { x, y, w, h } = area;
+    const buttons2 = [];
+    const lastFrame = frames[frames.length - 1];
+    if (!lastFrame) return buttons2;
+    const battle = lastFrame.battleState;
+    const outcome = battle.outcome;
+    ctx2.fillStyle = "rgba(0, 0, 0, 0.75)";
+    ctx2.fillRect(x, y, w, h);
+    const panelW = 400;
+    const panelH = 220;
+    const panelX = x + (w - panelW) / 2;
+    const panelY = y + (h - panelH) / 2 - 20;
+    drawPanel(ctx2, panelX, panelY, panelW, panelH, COLORS.textGold, 12);
+    ctx2.fillStyle = COLORS.textGold;
+    ctx2.font = FONT.title;
+    ctx2.textAlign = "center";
+    ctx2.textBaseline = "top";
+    ctx2.fillText("BATTLE COMPLETE", panelX + panelW / 2, panelY + 15);
+    if (outcome) {
+      const winnerText = outcome.winner ? `${outcome.winner === "PLAYER_1" ? "Player 1" : "Player 2"} wins!` : "Draw!";
+      const winnerColor = outcome.winner ? playerColor(outcome.winner) : COLORS.textDim;
+      ctx2.fillStyle = winnerColor;
+      ctx2.font = FONT.subtitle;
+      ctx2.fillText(winnerText, panelX + panelW / 2, panelY + 50);
+      ctx2.fillStyle = COLORS.text;
+      ctx2.font = FONT.body;
+      let statY = panelY + 80;
+      if (outcome.championDeaths.length > 0) {
+        ctx2.fillText(
+          `Champion killed: ${outcome.championDeaths.map((p) => p === "PLAYER_1" ? "P1" : "P2").join(", ")}`,
+          panelX + panelW / 2,
+          statY
+        );
+        statY += 20;
+      }
+      ctx2.fillText(
+        `Lane push: +${outcome.lanePushBonus} zones`,
+        panelX + panelW / 2,
+        statY
+      );
+      statY += 20;
+      ctx2.fillStyle = COLORS.textGold;
+      ctx2.fillText(
+        `Gold: P1 +${outcome.goldAwarded.PLAYER_1} | P2 +${outcome.goldAwarded.PLAYER_2}`,
+        panelX + panelW / 2,
+        statY
+      );
+      statY += 20;
+      ctx2.fillStyle = COLORS.energy;
+      ctx2.fillText(
+        `XP: P1 +${outcome.xpAwarded.PLAYER_1} | P2 +${outcome.xpAwarded.PLAYER_2}`,
+        panelX + panelW / 2,
+        statY
+      );
+    }
+    ctx2.textBaseline = "alphabetic";
+    buttons2.push(renderActionButton(
+      ctx2,
+      panelX + panelW / 2 - 70,
+      panelY + panelH - 50,
+      140,
+      36,
+      "Continue",
+      onContinue
+    ));
+    return buttons2;
+  }
+
+  // src/web/main.ts
+  var W = 1200;
+  var H = 800;
+  var LAYOUT = {
+    hud: { x: 10, y: 5, w: W - 20, h: 65 },
+    map: { x: 20, y: 75, w: W - 40, h: 340 },
+    message: { x: 20, y: 420, w: W - 40, h: 30 },
+    cards: { x: 20, y: 455, w: W - 40, h: 195 },
+    bottom: { x: 20, y: 655, w: W - 40, h: 30 }
+  };
+  var controller = new GameController();
+  var selectedCardIndex = -1;
+  var spawnCount = 0;
+  var canvas;
+  var ctx;
+  var buttons = [];
+  var mouseX = 0;
+  var mouseY = 0;
+  var viewMode = "STRATEGIC";
+  var transition = null;
+  var lastTimestamp = 0;
+  var battleFrameIndex = 0;
+  var battleAutoPlayTimer = 0;
+  var battleShowResult = false;
+  var BATTLE_FRAME_DURATION = 1500;
+  function init() {
+    canvas = document.getElementById("game");
+    ctx = canvas.getContext("2d");
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = W * dpr;
+    canvas.height = H * dpr;
+    canvas.style.width = `${W}px`;
+    canvas.style.height = `${H}px`;
+    ctx.scale(dpr, dpr);
+    canvas.addEventListener("click", handleClick);
+    canvas.addEventListener("mousemove", handleMouseMove);
+    requestAnimationFrame(gameLoop);
+  }
+  function gameLoop(timestamp) {
+    const dt = timestamp - lastTimestamp;
+    lastTimestamp = timestamp;
+    update(timestamp, dt);
+    render(timestamp);
+    requestAnimationFrame(gameLoop);
+  }
+  function update(now, dt) {
+    const ui = controller.getUIState();
+    if (ui.phase === "BATTLE_REPLAY" && viewMode === "STRATEGIC") {
+      viewMode = "TRANSITION_TO_BATTLE";
+      transition = createTransition("TRANSITION_TO_BATTLE", now, 1500, W / 2, LAYOUT.map.y + LAYOUT.map.h / 2);
+      battleFrameIndex = 0;
+      battleAutoPlayTimer = 0;
+      battleShowResult = false;
+    }
+    if (transition) {
+      const progress = getTransitionProgress(transition, now);
+      if (progress >= 1) {
+        if (transition.mode === "TRANSITION_TO_BATTLE") {
+          viewMode = "BATTLE";
+          transition = null;
+        } else if (transition.mode === "TRANSITION_TO_STRATEGIC") {
+          viewMode = "STRATEGIC";
+          transition = null;
+        }
+      }
+    }
+    if (viewMode === "BATTLE" && !battleShowResult) {
+      battleAutoPlayTimer += dt;
+      if (battleAutoPlayTimer >= BATTLE_FRAME_DURATION) {
+        battleAutoPlayTimer = 0;
+        const frames = ui.battleFrames;
+        if (battleFrameIndex < frames.length - 1) {
+          battleFrameIndex++;
+        } else {
+          battleShowResult = true;
+        }
+      }
+    }
+  }
+  function handleClick(e) {
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    for (const btn of buttons) {
+      if (mx >= btn.x && mx <= btn.x + btn.w && my >= btn.y && my <= btn.y + btn.h) {
+        btn.action();
+        return;
+      }
+    }
+  }
+  function handleMouseMove(e) {
+    const rect = canvas.getBoundingClientRect();
+    mouseX = e.clientX - rect.left;
+    mouseY = e.clientY - rect.top;
+  }
+  function render(now) {
+    buttons = [];
+    const ui = controller.getUIState();
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    if (viewMode === "STRATEGIC" || viewMode === "TRANSITION_TO_BATTLE") {
+      renderStrategicView(now, ui);
+    }
+    if (viewMode === "TRANSITION_TO_BATTLE" && transition) {
+      renderBattleTransition(now, ui);
+    }
+    if (viewMode === "BATTLE") {
+      renderBattlePhase(now, ui);
+    }
+    if (viewMode === "TRANSITION_TO_STRATEGIC" && transition) {
+      const progress = getTransitionProgress(transition, now);
+      const alpha = easeOutCubic(progress);
+      ctx.globalAlpha = alpha;
+      renderStrategicView(now, ui);
+      ctx.globalAlpha = 1;
+    }
+    renderFloatingTexts(ctx, now);
+  }
+  function renderStrategicView(now, ui) {
+    const gs = ui.gameState;
+    const lane = gs.lanes["MID"];
+    renderHUD(ctx, gs, ui.phase, LAYOUT.hud);
+    renderStrategicMap(ctx, lane, gs.players, LAYOUT.map, now);
+    renderMessageBar(ctx, ui.message, LAYOUT.message.x, LAYOUT.message.y, LAYOUT.message.w, LAYOUT.message.h);
+    const currentPlayer = ui.phase === "P1_PLANNING" ? "PLAYER_1" : "PLAYER_2";
+    if (ui.phase === "P1_PLANNING" || ui.phase === "P2_PLANNING") {
+      const playerIdx = currentPlayer === "PLAYER_1" ? 0 : 1;
+      const player = gs.players[playerIdx];
+      const hand = player.hand;
+      const champAlive = controller.isChampionAlive(currentPlayer);
+      if (!champAlive) {
+        ctx.fillStyle = COLORS.hpLow;
+        ctx.font = FONT.subtitle;
+        ctx.textAlign = "center";
+        ctx.fillText("Champion is dead! Click Skip to continue.", W / 2, LAYOUT.cards.y + 60);
+        buttons.push(renderActionButton(ctx, W / 2 - 70, LAYOUT.cards.y + 80, 140, 36, "Skip Turn", () => {
+          controller.skipPlanning(currentPlayer);
+          selectedCardIndex = -1;
+          spawnCount = 0;
+        }));
+      } else {
+        ctx.fillStyle = COLORS.text;
+        ctx.font = FONT.subtitle;
+        ctx.textAlign = "left";
+        ctx.fillText(
+          `${currentPlayer === "PLAYER_1" ? "Player 1" : "Player 2"}'s Turn \u2014 Select a card:`,
+          LAYOUT.cards.x + 10,
+          LAYOUT.cards.y + 16
+        );
+        const cardButtons = renderCardHand(
+          ctx,
+          hand,
+          selectedCardIndex,
+          { x: LAYOUT.cards.x, y: LAYOUT.cards.y + 22, w: LAYOUT.cards.w, h: LAYOUT.cards.h - 50 },
+          (index) => {
+            selectedCardIndex = index;
+            spawnCount = 0;
+          }
+        );
+        buttons.push(...cardButtons);
+        const maxSpawns = controller.getMaxSpawns(currentPlayer);
+        const spawnButtons = renderSpawnControls(
+          ctx,
+          LAYOUT.bottom.x,
+          LAYOUT.bottom.y,
+          spawnCount,
+          maxSpawns,
+          player.gold,
+          () => {
+            if (spawnCount > 0) spawnCount--;
+          },
+          () => {
+            if (spawnCount < maxSpawns) spawnCount++;
+          }
+        );
+        buttons.push(...spawnButtons);
+        if (selectedCardIndex >= 0) {
+          buttons.push(renderActionButton(
+            ctx,
+            W - 200,
+            LAYOUT.bottom.y - 4,
+            160,
+            32,
+            "Confirm",
+            () => {
+              const card = hand[selectedCardIndex];
+              controller.submitPlanning(currentPlayer, card.cardId, spawnCount);
+              selectedCardIndex = -1;
+              spawnCount = 0;
+            }
+          ));
+        }
+      }
+    } else if (ui.phase === "GAME_OVER") {
+      ctx.fillStyle = "rgba(0,0,0,0.5)";
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = COLORS.textGold;
+      ctx.font = "bold 32px 'Segoe UI', Arial, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(ui.message, W / 2, H / 2 - 30);
+      buttons.push(renderActionButton(ctx, W / 2 - 80, H / 2 + 10, 160, 40, "Play Again", () => {
+        controller.restart();
+        selectedCardIndex = -1;
+        spawnCount = 0;
+        viewMode = "STRATEGIC";
+        battleFrameIndex = 0;
+        battleShowResult = false;
+      }));
+    }
+  }
+  function renderBattleTransition(now, ui) {
+    if (!transition) return;
+    const progress = getTransitionProgress(transition, now);
+    if (progress < 0.33) {
+      const flashT = progress / 0.33;
+      const alpha = 1 - flashT;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = COLORS.textGold;
+      ctx.font = "bold 48px 'Segoe UI', Arial, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.shadowBlur = 20;
+      ctx.shadowColor = COLORS.textGold;
+      ctx.fillText("BATTLE!", W / 2, H / 2);
+      ctx.shadowBlur = 0;
+      for (let i = 0; i < 3; i++) {
+        const ringT = Math.max(0, flashT - i * 0.1);
+        const radius = ringT * 200;
+        ctx.beginPath();
+        ctx.arc(W / 2, H / 2, radius, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(240, 192, 32, ${(1 - ringT) * 0.5})`;
+        ctx.lineWidth = 3;
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+    if (progress >= 0.33) {
+      const fadeT = (progress - 0.33) / 0.67;
+      ctx.save();
+      ctx.globalAlpha = fadeT * 0.85;
+      ctx.fillStyle = COLORS.bg;
+      ctx.fillRect(0, 0, W, H);
+      ctx.restore();
+    }
+  }
+  function renderBattlePhase(now, ui) {
+    const frames = ui.battleFrames;
+    if (frames.length === 0) return;
+    const battleButtons = renderBattleView(
+      ctx,
+      frames,
+      battleFrameIndex,
+      { x: 0, y: 0, w: W, h: H },
+      now
+    );
+    buttons.push(...battleButtons);
+    if (!battleShowResult) {
+      buttons.push(renderActionButton(
+        ctx,
+        W - 150,
+        H - 50,
+        120,
+        34,
+        "Skip",
+        () => {
+          battleFrameIndex = frames.length - 1;
+          battleShowResult = true;
+        }
+      ));
+    }
+    if (battleShowResult) {
+      const resultButtons = renderBattleResult(
+        ctx,
+        frames,
+        { x: 0, y: 0, w: W, h: H },
+        () => {
+          controller.finishBattle();
+          battleShowResult = false;
+          battleFrameIndex = 0;
+          if (controller.getUIState().phase === "GAME_OVER") {
+            viewMode = "STRATEGIC";
+          } else {
+            viewMode = "TRANSITION_TO_STRATEGIC";
+            transition = createTransition("TRANSITION_TO_STRATEGIC", now, 800, W / 2, H / 2);
+          }
+        }
+      );
+      buttons.push(...resultButtons);
+    }
   }
   window.addEventListener("DOMContentLoaded", init);
 })();

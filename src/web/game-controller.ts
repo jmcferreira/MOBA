@@ -2,7 +2,7 @@
  * Browser-side game controller. Wraps the core game logic
  * and exposes a simple API for the Canvas UI to call.
  */
-import { createGameState, executeTurn, checkWinCondition } from "../systems/game-loop.js";
+import { createGameState, executeTurn, checkWinCondition, BattleRunner } from "../systems/game-loop.js";
 import {
   preparePlanningPhase,
   applyPlanningInput,
@@ -21,14 +21,30 @@ import {
 } from "../types/enums.js";
 import { GameState } from "../types/game-state.js";
 import { BattleAction } from "../types/actions.js";
-import { BattleState } from "../types/battle.js";
+import { BattleState, BattleOutcome } from "../types/battle.js";
 import { PlanningSubmission } from "../types/planning.js";
 import { PlanningCard } from "../types/card.js";
 import { TurnLogEntry } from "../types/log.js";
-import { MINION_SPAWN_COST, MAX_MINIONS_PER_SPAWN } from "../types/constants.js";
+import { LaneState } from "../types/lane.js";
+import { Champion } from "../types/champion.js";
+import { MINION_SPAWN_COST, MAX_MINIONS_PER_SPAWN, BATTLE_ROUND_LIMIT } from "../types/constants.js";
 import { resetIdCounter } from "../utils/id-generator.js";
+import { setupBattle, executeBattleRound, calculateBattleOutcome, ActionProvider } from "../systems/battle-system.js";
+import { findUnitById } from "../battle/action-executor.js";
 
-export type GamePhase = "P1_PLANNING" | "P2_PLANNING" | "RESOLVING" | "GAME_OVER";
+export type GamePhase = "P1_PLANNING" | "P2_PLANNING" | "RESOLVING" | "BATTLE_REPLAY" | "GAME_OVER";
+
+export interface BattleFrameAction {
+  actorId: string;
+  actionType: ActionType;
+  targetId?: string;
+  description: string;
+}
+
+export interface BattleFrame {
+  battleState: BattleState;
+  action: BattleFrameAction | null;
+}
 
 export interface UIState {
   gameState: GameState;
@@ -36,9 +52,11 @@ export interface UIState {
   p1Submission: PlanningSubmission | null;
   lastTurnLog: TurnLogEntry | null;
   message: string;
+  battleFrames: BattleFrame[];
 }
 
-// Battle AI for automatic battle resolution
+// ── Battle AI ──────────────────────────────────────────────
+
 function battleAI(unitId: string, battle: BattleState): BattleAction {
   const bc = battle.champions.find((c) => c.championRef.championId === unitId);
   if (!bc) return { actorId: unitId, actionType: ActionType.Wait };
@@ -57,7 +75,6 @@ function battleAI(unitId: string, battle: BattleState): BattleAction {
     Math.abs(myPos.q + myPos.r - (enemyPos.q + enemyPos.r))
   );
 
-  // Try abilities first
   for (const ability of champ.abilities) {
     if (
       ability.cooldownRemaining === 0 &&
@@ -90,6 +107,59 @@ function battleAI(unitId: string, battle: BattleState): BattleAction {
   };
 }
 
+// ── Battle Recording ───────────────────────────────────────
+
+function runBattleRecorded(
+  laneId: LaneId,
+  lane: LaneState,
+  p1Champion: Champion,
+  p2Champion: Champion,
+  p1Stance: LaneStance,
+  p2Stance: LaneStance,
+  actionProvider: ActionProvider
+): { outcome: BattleOutcome; frames: BattleFrame[] } {
+  const battle = setupBattle(laneId, lane, p1Champion, p2Champion, p1Stance, p2Stance);
+  const frames: BattleFrame[] = [];
+
+  // Initial frame
+  frames.push({ battleState: structuredClone(battle), action: null });
+
+  // Run rounds — capture state after each round
+  while (!battle.isComplete && battle.roundNumber <= BATTLE_ROUND_LIMIT) {
+    const roundNum = battle.roundNumber;
+    executeBattleRound(battle, actionProvider);
+
+    frames.push({
+      battleState: structuredClone(battle),
+      action: {
+        actorId: "",
+        actionType: ActionType.Wait,
+        description: battle.isComplete
+          ? "Battle ends!"
+          : `Round ${roundNum} complete`,
+      },
+    });
+  }
+
+  const outcome = calculateBattleOutcome(battle);
+  battle.outcome = outcome;
+
+  frames.push({
+    battleState: structuredClone(battle),
+    action: {
+      actorId: "",
+      actionType: ActionType.Wait,
+      description: outcome.winner
+        ? `${outcome.winner === "PLAYER_1" ? "Player 1" : "Player 2"} wins the battle!`
+        : "Battle ends in a draw!",
+    },
+  });
+
+  return { outcome, frames };
+}
+
+// ── Game Controller ────────────────────────────────────────
+
 export class GameController {
   state: GameState;
   phase: GamePhase;
@@ -97,6 +167,8 @@ export class GameController {
   lastTurnLog: TurnLogEntry | null = null;
   message: string = "Player 1: Choose a card and spawn minions.";
   laneId = LaneId.Mid;
+  battleFrames: BattleFrame[] = [];
+  private pendingTurnMessage: string = "";
 
   constructor() {
     resetIdCounter();
@@ -113,6 +185,7 @@ export class GameController {
     this.p1Submission = null;
     this.lastTurnLog = null;
     this.message = "Player 1: Choose a card and spawn minions.";
+    this.battleFrames = [];
   }
 
   getPlayerHand(playerId: PlayerId): PlanningCard[] {
@@ -138,7 +211,6 @@ export class GameController {
     const champ = player.champions[0];
 
     if (!champ || !champ.isAlive) {
-      // Skip — champion dead
       if (playerId === "PLAYER_1") {
         this.p1Submission = createEmptySubmission("PLAYER_1");
         this.phase = "P2_PLANNING";
@@ -182,8 +254,19 @@ export class GameController {
   private resolveTurn(p2Submission: PlanningSubmission): void {
     this.phase = "RESOLVING";
     const p1Sub = this.p1Submission ?? createEmptySubmission("PLAYER_1");
+    this.battleFrames = [];
 
-    executeTurn(this.state, p1Sub, p2Submission, battleAI);
+    // Use a recording battle runner that captures frames
+    let recordedFrames: BattleFrame[] = [];
+    const recordingRunner: BattleRunner = (
+      lId, ln, p1C, p2C, p1S, p2S, ap
+    ) => {
+      const result = runBattleRecorded(lId, ln, p1C, p2C, p1S, p2S, ap);
+      recordedFrames = result.frames;
+      return result.outcome;
+    };
+
+    executeTurn(this.state, p1Sub, p2Submission, battleAI, recordingRunner);
 
     this.lastTurnLog = this.state.turnLog[this.state.turnLog.length - 1];
 
@@ -202,15 +285,38 @@ export class GameController {
       }
     }
 
+    // Check if battle occurred and we have frames to show
+    if (recordedFrames.length > 0) {
+      this.battleFrames = recordedFrames;
+      this.pendingTurnMessage = msg;
+      this.phase = "BATTLE_REPLAY";
+      this.message = "Battle in progress!";
+      return;
+    }
+
     if (this.state.result !== GameResult.InProgress) {
       this.phase = "GAME_OVER";
       this.message = `GAME OVER: ${this.state.result}`;
     } else {
-      // Prepare next turn
       preparePlanningPhase(this.state);
       this.p1Submission = null;
       this.phase = "P1_PLANNING";
       this.message = msg + " Player 1: Choose a card.";
+    }
+  }
+
+  /** Called by the UI after battle replay finishes */
+  finishBattle(): void {
+    this.battleFrames = [];
+
+    if (this.state.result !== GameResult.InProgress) {
+      this.phase = "GAME_OVER";
+      this.message = `GAME OVER: ${this.state.result}`;
+    } else {
+      preparePlanningPhase(this.state);
+      this.p1Submission = null;
+      this.phase = "P1_PLANNING";
+      this.message = this.pendingTurnMessage + " Player 1: Choose a card.";
     }
   }
 
@@ -221,6 +327,7 @@ export class GameController {
       p1Submission: this.p1Submission,
       lastTurnLog: this.lastTurnLog,
       message: this.message,
+      battleFrames: this.battleFrames,
     };
   }
 }
