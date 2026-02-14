@@ -1,0 +1,87 @@
+import { ChampionDefinition } from "../../types/champion.js";
+import {
+  ChampionRole,
+  DamageType,
+  AbilityTargetType,
+  ActionType,
+  StatusEffectType,
+} from "../../types/enums.js";
+
+export const IRONCLAD: ChampionDefinition = {
+  championId: "IRONCLAD",
+  name: "Ironclad",
+  role: ChampionRole.Tank,
+  maxHp: 20,
+  armor: 3,
+  magicResist: 1,
+  maxEnergy: 6,
+  moveSpeed: 2,
+  attackRange: 1,
+  attackDamage: 3,
+  damageType: DamageType.Physical,
+  abilities: [
+    {
+      abilityId: "SHIELD_BASH",
+      name: "Shield Bash",
+      description: "Advance and bash an enemy, pushing them back 1 hex.",
+      energyCost: 2,
+      cooldownMax: 1,
+      range: 1,
+      targetType: AbilityTargetType.SingleEnemy,
+      damageType: DamageType.Physical,
+      baseDamage: 4,
+      aoeRadius: 0,
+      effects: [{ type: "PUSH", value: 1, duration: 0 }],
+      scriptedActions: [
+        { type: ActionType.Move, distance: 1, target: AbilityTargetType.SingleEnemy },
+        {
+          type: ActionType.Attack,
+          damage: 4,
+          damageType: DamageType.Physical,
+          effects: [{ type: "PUSH", value: 1, duration: 0 }],
+        },
+      ],
+    },
+    {
+      abilityId: "FORTRESS",
+      name: "Fortress",
+      description: "Brace for impact, gaining a shield that absorbs 4 damage for 2 rounds.",
+      energyCost: 3,
+      cooldownMax: 2,
+      range: 0,
+      targetType: AbilityTargetType.Self,
+      damageType: DamageType.Physical,
+      baseDamage: 0,
+      aoeRadius: 0,
+      effects: [{ type: StatusEffectType.Shield, value: 4, duration: 2 }],
+      scriptedActions: [
+        {
+          type: ActionType.Defend,
+          effects: [{ type: StatusEffectType.Shield, value: 4, duration: 2 }],
+        },
+      ],
+    },
+    {
+      abilityId: "CHARGE",
+      name: "Charge",
+      description: "Rush up to 3 hexes toward an enemy, dealing damage and stunning them.",
+      energyCost: 2,
+      cooldownMax: 1,
+      range: 3,
+      targetType: AbilityTargetType.SingleEnemy,
+      damageType: DamageType.Physical,
+      baseDamage: 2,
+      aoeRadius: 0,
+      effects: [{ type: StatusEffectType.Stun, value: 0, duration: 1 }],
+      scriptedActions: [
+        { type: ActionType.Move, distance: 3, target: AbilityTargetType.SingleEnemy },
+        {
+          type: ActionType.Attack,
+          damage: 2,
+          damageType: DamageType.Physical,
+          effects: [{ type: StatusEffectType.Stun, value: 0, duration: 1 }],
+        },
+      ],
+    },
+  ],
+};
