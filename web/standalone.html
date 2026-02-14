@@ -1,0 +1,1995 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MOBA Board Game</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #0d0d1a;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      font-family: monospace;
+    }
+    canvas {
+      border: 2px solid #333;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game" width="900" height="700"></canvas>
+  <script>
+"use strict";
+(() => {
+  var __defProp = Object.defineProperty;
+  var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+  var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
+
+  // src/types/enums.ts
+  var StatusEffectType = /* @__PURE__ */ ((StatusEffectType2) => {
+    StatusEffectType2["Stun"] = "STUN";
+    StatusEffectType2["Slow"] = "SLOW";
+    StatusEffectType2["Shield"] = "SHIELD";
+    StatusEffectType2["BuffAttack"] = "BUFF_ATTACK";
+    StatusEffectType2["DebuffArmor"] = "DEBUFF_ARMOR";
+    return StatusEffectType2;
+  })(StatusEffectType || {});
+
+  // src/types/constants.ts
+  var LANE_ZONE_COUNT = 7;
+  var INITIAL_FRONTLINE = 3;
+  var TOWER_HP = 10;
+  var BASE_HP = 20;
+  var PASSIVE_GOLD_PER_TURN = 3;
+  var STARTING_GOLD = 5;
+  var MINION_SPAWN_COST = 2;
+  var MAX_MINIONS_PER_SPAWN = 3;
+  var MINION_BASE_HP = 2;
+  var MINION_BASE_ATTACK = 1;
+  var MINION_KILL_GOLD = 1;
+  var CHAMPION_KILL_GOLD = 5;
+  var BATTLE_ROUND_LIMIT = 2;
+  var BATTLE_GRID_WIDTH = 7;
+  var BATTLE_GRID_HEIGHT = 5;
+  var MAX_ENERGY = 6;
+  var ENERGY_PER_ROUND = 3;
+  var MAX_TURNS = 20;
+  var HAND_SIZE = 5;
+  var FREE_MINIONS_PER_LANE = 1;
+  var RESPAWN_TIMER = 1;
+  var LEVEL_UP_XP_COST = [0, 3, 7, 12, 18];
+  var MAX_BATTLE_MINIONS_PER_SIDE = 3;
+
+  // src/utils/math.ts
+  function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+  }
+  function sign(value) {
+    if (value > 0) return 1;
+    if (value < 0) return -1;
+    return 0;
+  }
+
+  // src/systems/lane-system.ts
+  function emptyMinionGroup() {
+    return { count: 0, totalHp: 0, attack: MINION_BASE_ATTACK };
+  }
+  function createZone(index) {
+    return {
+      zoneIndex: index,
+      minions: {
+        player1: emptyMinionGroup(),
+        player2: emptyMinionGroup()
+      },
+      championsPresent: []
+    };
+  }
+  function createLaneState(laneId) {
+    const zones = [];
+    for (let i = 0; i < LANE_ZONE_COUNT; i++) {
+      zones.push(createZone(i));
+    }
+    return {
+      laneId,
+      frontlinePosition: INITIAL_FRONTLINE,
+      zones,
+      towerHp: { player1: TOWER_HP, player2: TOWER_HP },
+      baseHp: { player1: BASE_HP, player2: BASE_HP }
+    };
+  }
+
+  // src/systems/card-system.ts
+  function drawToHandLimit(player) {
+    while (player.hand.length < HAND_SIZE && player.deck.length > 0) {
+      player.hand.push(player.deck.pop());
+    }
+    if (player.hand.length < HAND_SIZE && player.deck.length === 0 && player.discard.length > 0) {
+      player.deck = shuffleDeck(player.discard);
+      player.discard = [];
+      while (player.hand.length < HAND_SIZE && player.deck.length > 0) {
+        player.hand.push(player.deck.pop());
+      }
+    }
+  }
+  function playCard(player, cardId) {
+    const idx = player.hand.findIndex((c) => c.cardId === cardId);
+    if (idx === -1) return null;
+    const [card] = player.hand.splice(idx, 1);
+    player.discard.push(card);
+    return card;
+  }
+  function sumCardEffects(card, effectType) {
+    if (!card) return 0;
+    return card.effects.filter((e) => e.type === effectType).reduce((sum, e) => sum + e.value, 0);
+  }
+  function shuffleDeck(cards, seed) {
+    const result = [...cards];
+    let s = seed ?? Date.now();
+    const random = () => {
+      s = s * 1664525 + 1013904223 & 2147483647;
+      return s / 2147483647;
+    };
+    for (let i = result.length - 1; i > 0; i--) {
+      const j = Math.floor(random() * (i + 1));
+      [result[i], result[j]] = [result[j], result[i]];
+    }
+    return result;
+  }
+  function createPlayerDeck(cardPool) {
+    const deck = [...cardPool];
+    return { deck: shuffleDeck(deck), hand: [], discard: [] };
+  }
+
+  // src/systems/champion-system.ts
+  function createChampionFromDefinition(def, ownerId) {
+    return {
+      ...def,
+      ownerId,
+      currentHp: def.maxHp,
+      currentEnergy: def.maxEnergy,
+      level: 1,
+      xp: 0,
+      abilities: def.abilities.map((a) => ({ ...a, cooldownRemaining: 0 })),
+      assignedLane: null,
+      laneStance: null,
+      currentZone: null,
+      battlePosition: null,
+      isAlive: true,
+      respawnTimer: 0,
+      statusEffects: []
+    };
+  }
+  function tickRespawn(champion) {
+    if (champion.respawnTimer > 0) {
+      champion.respawnTimer -= 1;
+      if (champion.respawnTimer === 0) {
+        champion.isAlive = true;
+        champion.currentHp = champion.maxHp;
+        champion.currentEnergy = champion.maxEnergy;
+        champion.statusEffects = [];
+      }
+    }
+  }
+  function tickCooldowns(champion) {
+    for (const ability of champion.abilities) {
+      if (ability.cooldownRemaining > 0) {
+        ability.cooldownRemaining -= 1;
+      }
+    }
+  }
+  function killChampion(champion) {
+    champion.isAlive = false;
+    champion.currentHp = 0;
+    champion.respawnTimer = RESPAWN_TIMER;
+    champion.battlePosition = null;
+    champion.assignedLane = null;
+    champion.laneStance = null;
+    champion.currentZone = null;
+  }
+  function checkLevelUp(champion) {
+    if (champion.level >= LEVEL_UP_XP_COST.length) return false;
+    if (champion.xp >= LEVEL_UP_XP_COST[champion.level]) {
+      champion.level += 1;
+      applyLevelUpBonus(champion);
+      return true;
+    }
+    return false;
+  }
+  function applyLevelUpBonus(champion) {
+    champion.maxHp += 2;
+    champion.currentHp = Math.min(champion.currentHp + 2, champion.maxHp);
+    champion.attackDamage += 1;
+    champion.maxEnergy += 1;
+  }
+
+  // src/systems/resolution-system.ts
+  function resolveLane(lane, p1Card, p2Card, p1Champion, p2Champion, p1SpawnCount, p2SpawnCount) {
+    const frontlineBefore = lane.frontlinePosition;
+    spawnMinions(lane, p1Card, p2Card, p1SpawnCount, p2SpawnCount);
+    const p1Stance = p1Card?.stance ?? null;
+    const p2Stance = p2Card?.stance ?? null;
+    let p1ChampZone = null;
+    let p2ChampZone = null;
+    if (p1Champion && p1Champion.isAlive && p1Stance !== null) {
+      p1ChampZone = calculateChampionZone(lane, "PLAYER_1", p1Stance);
+      p1Champion.currentZone = p1ChampZone;
+      lane.zones[p1ChampZone].championsPresent.push("PLAYER_1");
+    }
+    if (p2Champion && p2Champion.isAlive && p2Stance !== null) {
+      p2ChampZone = calculateChampionZone(lane, "PLAYER_2", p2Stance);
+      p2Champion.currentZone = p2ChampZone;
+      lane.zones[p2ChampZone].championsPresent.push("PLAYER_2");
+    }
+    const minionCombatLog = resolveMinionCombat(lane, p1Card, p2Card);
+    const pushDelta = calculatePush(minionCombatLog, p1Stance, p2Stance);
+    const prevFrontline = lane.frontlinePosition;
+    lane.frontlinePosition = clamp(
+      lane.frontlinePosition + pushDelta,
+      0,
+      LANE_ZONE_COUNT - 1
+    );
+    const towerDamage = applyStructureDamage(lane, minionCombatLog, p1Card, p2Card);
+    const battleTriggered = checkBattleTrigger(
+      p1Stance,
+      p2Stance,
+      p1ChampZone,
+      p2ChampZone
+    );
+    const goldAwarded = calculateGoldAwards(minionCombatLog, p1Card, p2Card);
+    return {
+      result: {
+        laneId: lane.laneId,
+        minionCombatLog,
+        frontlineBefore,
+        frontlineAfter: lane.frontlinePosition,
+        battleTriggered,
+        towerDamage: {
+          PLAYER_1: towerDamage.player1,
+          PLAYER_2: towerDamage.player2
+        }
+      },
+      battleTriggered,
+      goldAwarded
+    };
+  }
+  function spawnMinions(lane, p1Card, p2Card, p1Purchased, p2Purchased) {
+    const p1Bonus = sumCardEffects(p1Card, "BONUS_MINIONS" /* BonusMinions */);
+    const p2Bonus = sumCardEffects(p2Card, "BONUS_MINIONS" /* BonusMinions */);
+    const p1Total = FREE_MINIONS_PER_LANE + p1Purchased + p1Bonus;
+    const p2Total = FREE_MINIONS_PER_LANE + p2Purchased + p2Bonus;
+    const frontZone = lane.zones[lane.frontlinePosition];
+    frontZone.minions.player1.count += p1Total;
+    frontZone.minions.player1.totalHp += p1Total * MINION_BASE_HP;
+    frontZone.minions.player2.count += p2Total;
+    frontZone.minions.player2.totalHp += p2Total * MINION_BASE_HP;
+  }
+  function calculateChampionZone(lane, playerId, stance) {
+    const front = lane.frontlinePosition;
+    if (playerId === "PLAYER_1") {
+      switch (stance) {
+        case "AGGRO" /* Aggro */:
+          return Math.min(front + 1, LANE_ZONE_COUNT - 1);
+        case "DEFEND" /* Defend */:
+          return Math.max(front - 2, 1);
+        // At least tower zone
+        case "NEUTRAL" /* Neutral */:
+          return front;
+        case "AMBUSH" /* Ambush */:
+          return front;
+      }
+    } else {
+      switch (stance) {
+        case "AGGRO" /* Aggro */:
+          return Math.max(front - 1, 0);
+        case "DEFEND" /* Defend */:
+          return Math.min(front + 2, LANE_ZONE_COUNT - 2);
+        // At least own tower zone
+        case "NEUTRAL" /* Neutral */:
+          return front;
+        case "AMBUSH" /* Ambush */:
+          return front;
+      }
+    }
+  }
+  function resolveMinionCombat(lane, p1Card, p2Card) {
+    const frontZone = lane.zones[lane.frontlinePosition];
+    const p1Count = frontZone.minions.player1.count;
+    const p2Count = frontZone.minions.player2.count;
+    const p1Attack = MINION_BASE_ATTACK + sumCardEffects(p1Card, "MINION_DAMAGE_BOOST" /* MinionDamageBoost */);
+    const p2Attack = MINION_BASE_ATTACK + sumCardEffects(p2Card, "MINION_DAMAGE_BOOST" /* MinionDamageBoost */);
+    const p1MinionHp = MINION_BASE_HP + sumCardEffects(p1Card, "FORTIFY_MINIONS" /* FortifyMinions */);
+    const p2MinionHp = MINION_BASE_HP + sumCardEffects(p2Card, "FORTIFY_MINIONS" /* FortifyMinions */);
+    const p1TotalDamage = p1Count * p1Attack;
+    const p2TotalDamage = p2Count * p2Attack;
+    const p1RemainingHp = Math.max(0, p1Count * p1MinionHp - p2TotalDamage);
+    const p2RemainingHp = Math.max(0, p2Count * p2MinionHp - p1TotalDamage);
+    const p1Surviving = p1RemainingHp > 0 ? Math.ceil(p1RemainingHp / p1MinionHp) : 0;
+    const p2Surviving = p2RemainingHp > 0 ? Math.ceil(p2RemainingHp / p2MinionHp) : 0;
+    frontZone.minions.player1.count = p1Surviving;
+    frontZone.minions.player1.totalHp = p1RemainingHp;
+    frontZone.minions.player2.count = p2Surviving;
+    frontZone.minions.player2.totalHp = p2RemainingHp;
+    return {
+      player1MinionsStart: p1Count,
+      player2MinionsStart: p2Count,
+      player1MinionsEnd: p1Surviving,
+      player2MinionsEnd: p2Surviving,
+      player1Casualties: p1Count - p1Surviving,
+      player2Casualties: p2Count - p2Surviving
+    };
+  }
+  function calculatePush(combat, p1Stance, p2Stance) {
+    let basePush = 0;
+    if (combat.player1MinionsEnd > 0 && combat.player2MinionsEnd === 0) {
+      basePush = 1;
+    } else if (combat.player2MinionsEnd > 0 && combat.player1MinionsEnd === 0) {
+      basePush = -1;
+    }
+    let stancePush = 0;
+    if (p1Stance === "AGGRO" /* Aggro */ && combat.player1MinionsEnd >= combat.player2MinionsEnd) {
+      stancePush += 1;
+    }
+    if (p2Stance === "AGGRO" /* Aggro */ && combat.player2MinionsEnd >= combat.player1MinionsEnd) {
+      stancePush -= 1;
+    }
+    const totalPush = clamp(basePush + sign(stancePush), -2, 2);
+    return totalPush;
+  }
+  function applyStructureDamage(lane, combat, p1Card, p2Card) {
+    const towerDamage = { player1: 0, player2: 0 };
+    const p1TowerReduction = sumCardEffects(p2Card, "TOWER_DAMAGE_REDUCTION" /* TowerDamageReduction */);
+    const p2TowerReduction = sumCardEffects(p1Card, "TOWER_DAMAGE_REDUCTION" /* TowerDamageReduction */);
+    if (lane.frontlinePosition >= 5 && combat.player1MinionsEnd > 0) {
+      const rawDamage = combat.player1MinionsEnd;
+      const reducedDamage = Math.max(0, rawDamage - p1TowerReduction);
+      if (lane.towerHp.player2 > 0) {
+        const dmg = Math.min(reducedDamage, lane.towerHp.player2);
+        lane.towerHp.player2 -= dmg;
+        towerDamage.player2 += dmg;
+        if (lane.towerHp.player2 <= 0 && lane.frontlinePosition >= 6) {
+          const overflow = reducedDamage - dmg;
+          lane.baseHp.player2 -= overflow;
+          towerDamage.player2 += overflow;
+        }
+      } else if (lane.frontlinePosition >= 6) {
+        lane.baseHp.player2 -= reducedDamage;
+        towerDamage.player2 += reducedDamage;
+      }
+    }
+    if (lane.frontlinePosition <= 1 && combat.player2MinionsEnd > 0) {
+      const rawDamage = combat.player2MinionsEnd;
+      const reducedDamage = Math.max(0, rawDamage - p2TowerReduction);
+      if (lane.towerHp.player1 > 0) {
+        const dmg = Math.min(reducedDamage, lane.towerHp.player1);
+        lane.towerHp.player1 -= dmg;
+        towerDamage.player1 += dmg;
+        if (lane.towerHp.player1 <= 0 && lane.frontlinePosition <= 0) {
+          const overflow = reducedDamage - dmg;
+          lane.baseHp.player1 -= overflow;
+          towerDamage.player1 += overflow;
+        }
+      } else if (lane.frontlinePosition <= 0) {
+        lane.baseHp.player1 -= reducedDamage;
+        towerDamage.player1 += reducedDamage;
+      }
+    }
+    return towerDamage;
+  }
+  function checkBattleTrigger(p1Stance, p2Stance, p1ChampZone, p2ChampZone) {
+    if (p1ChampZone === null || p2ChampZone === null) return false;
+    if (p1Stance === null || p2Stance === null) return false;
+    if (p1Stance === "DEFEND" /* Defend */ && p2Stance === "DEFEND" /* Defend */) return false;
+    const championsClose = Math.abs(p1ChampZone - p2ChampZone) <= 1;
+    const aggressivePresent = p1Stance === "AGGRO" /* Aggro */ || p2Stance === "AGGRO" /* Aggro */ || p1Stance === "AMBUSH" /* Ambush */ || p2Stance === "AMBUSH" /* Ambush */;
+    if (championsClose && aggressivePresent) return true;
+    if (p1Stance === "AMBUSH" /* Ambush */ && p1ChampZone === p2ChampZone) return true;
+    if (p2Stance === "AMBUSH" /* Ambush */ && p2ChampZone === p1ChampZone) return true;
+    return false;
+  }
+  function calculateGoldAwards(combat, p1Card, p2Card) {
+    const p1Gold = PASSIVE_GOLD_PER_TURN + combat.player2Casualties * MINION_KILL_GOLD + sumCardEffects(p1Card, "BONUS_GOLD" /* BonusGold */);
+    const p2Gold = PASSIVE_GOLD_PER_TURN + combat.player1Casualties * MINION_KILL_GOLD + sumCardEffects(p2Card, "BONUS_GOLD" /* BonusGold */);
+    return { player1: p1Gold, player2: p2Gold };
+  }
+  function getLaneAssignment(submission, laneId) {
+    return submission.laneAssignments.find((a) => a.laneId === laneId);
+  }
+  function getSpawnOrder(submission, laneId) {
+    return submission.minionSpawnOrders.find((o) => o.laneId === laneId);
+  }
+
+  // src/types/hex.ts
+  var HEX_DIRECTIONS = [
+    { q: 1, r: 0 },
+    { q: 1, r: -1 },
+    { q: 0, r: -1 },
+    { q: -1, r: 0 },
+    { q: -1, r: 1 },
+    { q: 0, r: 1 }
+  ];
+
+  // src/battle/hex-grid.ts
+  function hexKey(coord) {
+    return `${coord.q},${coord.r}`;
+  }
+  function hexDistance(a, b) {
+    return Math.max(
+      Math.abs(a.q - b.q),
+      Math.abs(a.r - b.r),
+      Math.abs(a.q + a.r - (b.q + b.r))
+    );
+  }
+  function hexNeighbors(coord) {
+    return HEX_DIRECTIONS.map((d) => ({ q: coord.q + d.q, r: coord.r + d.r }));
+  }
+  function hexEquals(a, b) {
+    return a.q === b.q && a.r === b.r;
+  }
+  function createHexGrid(width, height) {
+    const cells = /* @__PURE__ */ new Map();
+    for (let q = 0; q < width; q++) {
+      for (let r = 0; r < height; r++) {
+        const coord = { q, r };
+        cells.set(hexKey(coord), {
+          coord,
+          terrain: "OPEN" /* Open */,
+          occupantId: null
+        });
+      }
+    }
+    return { width, height, cells };
+  }
+  function getCell(grid, coord) {
+    return grid.cells.get(hexKey(coord));
+  }
+  function isPassable(grid, coord) {
+    const cell = getCell(grid, coord);
+    if (!cell) return false;
+    return cell.terrain !== "BLOCKED" /* Blocked */ && cell.occupantId === null;
+  }
+  function findPath(grid, start, goal, maxSteps) {
+    if (hexEquals(start, goal)) return [start];
+    const visited = /* @__PURE__ */ new Map();
+    const queue = [start];
+    visited.set(hexKey(start), null);
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (hexEquals(current, goal)) {
+        const path = [];
+        let node = current;
+        while (node !== null) {
+          path.unshift(node);
+          const parentKey = visited.get(hexKey(node));
+          node = parentKey ? { q: parseInt(parentKey.split(",")[0]), r: parseInt(parentKey.split(",")[1]) } : null;
+        }
+        return path.slice(0, maxSteps + 1);
+      }
+      for (const neighbor of hexNeighbors(current)) {
+        const key = hexKey(neighbor);
+        if (!visited.has(key) && (isPassable(grid, neighbor) || hexEquals(neighbor, goal))) {
+          visited.set(key, hexKey(current));
+          queue.push(neighbor);
+        }
+      }
+    }
+    return [start];
+  }
+
+  // src/battle/turn-order.ts
+  var ROLE_INITIATIVE = {
+    ["ASSASSIN" /* Assassin */]: 5,
+    ["MAGE" /* Mage */]: 4,
+    ["FIGHTER" /* Fighter */]: 3,
+    ["SUPPORT" /* Support */]: 2,
+    ["TANK" /* Tank */]: 1
+  };
+  function getChampionInitiative(champion, stance) {
+    let init2 = ROLE_INITIATIVE[champion.role];
+    if (stance === "AMBUSH" /* Ambush */) init2 += 3;
+    if (stance === "DEFEND" /* Defend */) init2 -= 1;
+    return init2;
+  }
+  function buildTurnOrder(p1Champion, p2Champion, p1Stance, p2Stance, p1Minions, p2Minions) {
+    const p1Init = getChampionInitiative(p1Champion, p1Stance);
+    const p2Init = getChampionInitiative(p2Champion, p2Stance);
+    let firstChamp;
+    let secondChamp;
+    let firstMinions;
+    let secondMinions;
+    if (p1Init >= p2Init) {
+      firstChamp = p1Champion;
+      secondChamp = p2Champion;
+      firstMinions = p1Minions;
+      secondMinions = p2Minions;
+    } else {
+      firstChamp = p2Champion;
+      secondChamp = p1Champion;
+      firstMinions = p2Minions;
+      secondMinions = p1Minions;
+    }
+    const order = [];
+    order.push(firstChamp.championId);
+    for (const m of firstMinions) order.push(m.minionId);
+    order.push(secondChamp.championId);
+    for (const m of secondMinions) order.push(m.minionId);
+    return order;
+  }
+
+  // src/battle/action-executor.ts
+  function getUnitPosition(unit) {
+    return unit.kind === "champion" ? unit.ref.battlePosition : unit.ref.position;
+  }
+  function setUnitPosition(unit, pos, battle) {
+    const oldPos = getUnitPosition(unit);
+    const oldCell = getCell(battle.grid, oldPos);
+    if (oldCell) oldCell.occupantId = null;
+    if (unit.kind === "champion") {
+      unit.ref.battlePosition = pos;
+    } else {
+      unit.ref.position = pos;
+    }
+    const newCell = getCell(battle.grid, pos);
+    if (newCell) {
+      newCell.occupantId = unit.kind === "champion" ? unit.ref.championId : unit.ref.minionId;
+    }
+  }
+  function isUnitAlive(unit) {
+    return unit.kind === "champion" ? unit.ref.isAlive : unit.ref.isAlive;
+  }
+  function findUnitById(battle, id) {
+    for (const bc of battle.champions) {
+      if (bc.championRef.championId === id)
+        return { kind: "champion", ref: bc.championRef };
+    }
+    for (const m of battle.minions) {
+      if (m.minionId === id) return { kind: "minion", ref: m };
+    }
+    return null;
+  }
+  function applyDamage(target, rawDamage, damageType) {
+    let reduction = 0;
+    if (target.kind === "champion") {
+      const champ = target.ref;
+      if (damageType === "PHYSICAL" /* Physical */) reduction = champ.armor;
+      if (damageType === "MAGICAL" /* Magical */) reduction = champ.magicResist;
+      for (const effect of champ.statusEffects) {
+        if (effect.type === "SHIELD" /* Shield */) reduction += effect.value;
+      }
+      const finalDamage = Math.max(1, rawDamage - reduction);
+      champ.currentHp -= finalDamage;
+      if (champ.currentHp <= 0) {
+        champ.currentHp = 0;
+        champ.isAlive = false;
+      }
+      return finalDamage;
+    } else {
+      const finalDamage = Math.max(1, rawDamage);
+      target.ref.hp -= finalDamage;
+      if (target.ref.hp <= 0) {
+        target.ref.hp = 0;
+        target.ref.isAlive = false;
+      }
+      return finalDamage;
+    }
+  }
+  function executeMove(actor, targetHex, battle, maxDist) {
+    const start = getUnitPosition(actor);
+    const path = findPath(battle.grid, start, targetHex, maxDist);
+    if (path.length > 1) {
+      const dest = path[path.length - 1];
+      setUnitPosition(actor, dest, battle);
+    }
+  }
+  function executeBasicAttack(actor, target, battle) {
+    if (actor.kind === "champion") {
+      const champ = actor.ref;
+      const dist = hexDistance(getUnitPosition(actor), getUnitPosition(target));
+      if (dist > champ.attackRange) return 0;
+      return applyDamage(target, champ.attackDamage, champ.damageType);
+    } else {
+      const dist = hexDistance(getUnitPosition(actor), getUnitPosition(target));
+      if (dist > 1) return 0;
+      return applyDamage(target, actor.ref.attack, "PHYSICAL" /* Physical */);
+    }
+  }
+  function executeAbility(actor, ability, targetId, targetHex, battle) {
+    if (ability.cooldownRemaining > 0) return;
+    if (actor.currentEnergy < ability.energyCost) return;
+    actor.currentEnergy -= ability.energyCost;
+    ability.cooldownRemaining = ability.cooldownMax;
+    for (const step of ability.scriptedActions) {
+      if (step.type === "MOVE" /* Move */ && step.distance) {
+        const dest = targetHex ?? getUnitPosition({ kind: "champion", ref: actor });
+        executeMove(
+          { kind: "champion", ref: actor },
+          dest,
+          battle,
+          step.distance
+        );
+      }
+      if (step.type === "ATTACK" /* Attack */ && step.damage !== void 0) {
+        const target = targetId ? findUnitById(battle, targetId) : null;
+        if (target && isUnitAlive(target)) {
+          applyDamage(target, step.damage, step.damageType ?? actor.damageType);
+          if (step.effects) {
+            for (const effect of step.effects) {
+              applyAbilityEffect(effect, target, actor, battle);
+            }
+          }
+        }
+      }
+      if (step.type === "ABILITY" /* Ability */ && step.damage !== void 0) {
+        if (step.target === "AOE" && targetHex) {
+          const targets = getAllUnitsInRadius(battle, targetHex, ability.aoeRadius, actor.ownerId);
+          for (const t of targets) {
+            applyDamage(t, step.damage, step.damageType ?? ability.damageType);
+          }
+        } else if (targetId) {
+          const target = findUnitById(battle, targetId);
+          if (target && isUnitAlive(target)) {
+            applyDamage(target, step.damage, step.damageType ?? ability.damageType);
+          }
+        }
+      }
+      if (step.type === "DEFEND" /* Defend */ && step.effects) {
+        for (const effect of step.effects) {
+          applyAbilityEffect(effect, { kind: "champion", ref: actor }, actor, battle);
+        }
+      }
+    }
+  }
+  function applyAbilityEffect(effect, target, source, battle) {
+    if (target.kind !== "champion") return;
+    const statusType = effect.type;
+    if (Object.values(StatusEffectType).includes(statusType)) {
+      target.ref.statusEffects.push({
+        type: statusType,
+        value: effect.value,
+        remainingDuration: effect.duration,
+        sourceAbilityId: source.championId
+      });
+    }
+    if (effect.type === "PUSH" && effect.value > 0) {
+      const sourcePos = source.battlePosition;
+      const targetPos = getUnitPosition(target);
+      const dq = targetPos.q - sourcePos.q;
+      const dr = targetPos.r - sourcePos.r;
+      const pushDir = {
+        q: dq === 0 ? 0 : dq > 0 ? 1 : -1,
+        r: dr === 0 ? 0 : dr > 0 ? 1 : -1
+      };
+      for (let i = 0; i < effect.value; i++) {
+        const newPos = {
+          q: getUnitPosition(target).q + pushDir.q,
+          r: getUnitPosition(target).r + pushDir.r
+        };
+        if (isPassable(battle.grid, newPos)) {
+          setUnitPosition(target, newPos, battle);
+        } else {
+          break;
+        }
+      }
+    }
+  }
+  function getAllUnitsInRadius(battle, center, radius, excludeOwnerId) {
+    const units = [];
+    for (const bc of battle.champions) {
+      if (bc.championRef.isAlive && bc.championRef.ownerId !== excludeOwnerId && hexDistance(bc.championRef.battlePosition, center) <= radius) {
+        units.push({ kind: "champion", ref: bc.championRef });
+      }
+    }
+    for (const m of battle.minions) {
+      if (m.isAlive && m.ownerId !== excludeOwnerId && hexDistance(m.position, center) <= radius) {
+        units.push({ kind: "minion", ref: m });
+      }
+    }
+    return units;
+  }
+  function executeWait(actor) {
+    actor.currentEnergy = Math.min(actor.currentEnergy + 1, MAX_ENERGY);
+  }
+  function executeDefend(actor) {
+    actor.statusEffects.push({
+      type: "SHIELD" /* Shield */,
+      value: 2,
+      remainingDuration: 1,
+      sourceAbilityId: "DEFEND_ACTION"
+    });
+  }
+
+  // src/battle/minion-ai.ts
+  function executeMinionTurn(minion, battle) {
+    if (!minion.isAlive) return;
+    const enemies = getEnemyUnits(minion.ownerId, battle);
+    if (enemies.length === 0) return;
+    const minionPos = minion.position;
+    enemies.sort((a, b) => {
+      const aIsChamp = a.kind === "champion" ? 0 : 1;
+      const bIsChamp = b.kind === "champion" ? 0 : 1;
+      if (aIsChamp !== bIsChamp) return aIsChamp - bIsChamp;
+      return hexDistance(minionPos, getUnitPosition(a)) - hexDistance(minionPos, getUnitPosition(b));
+    });
+    const nearest = enemies[0];
+    const dist = hexDistance(minionPos, getUnitPosition(nearest));
+    if (dist <= 1) {
+      executeBasicAttack({ kind: "minion", ref: minion }, nearest, battle);
+    } else {
+      executeMove(
+        { kind: "minion", ref: minion },
+        getUnitPosition(nearest),
+        battle,
+        1
+      );
+    }
+  }
+  function getEnemyUnits(ownerId, battle) {
+    const enemies = [];
+    for (const bc of battle.champions) {
+      if (bc.championRef.isAlive && bc.championRef.ownerId !== ownerId) {
+        enemies.push({ kind: "champion", ref: bc.championRef });
+      }
+    }
+    for (const m of battle.minions) {
+      if (m.isAlive && m.ownerId !== ownerId) {
+        enemies.push({ kind: "minion", ref: m });
+      }
+    }
+    return enemies;
+  }
+
+  // src/utils/id-generator.ts
+  var nextId = 1;
+  function generateId(prefix) {
+    return `${prefix}_${nextId++}`;
+  }
+  function resetIdCounter() {
+    nextId = 1;
+  }
+
+  // src/systems/battle-system.ts
+  function setupBattle(laneId, lane, p1Champion, p2Champion, p1Stance, p2Stance) {
+    const grid = createHexGrid(BATTLE_GRID_WIDTH, BATTLE_GRID_HEIGHT);
+    const p1Start = getStartPosition("PLAYER_1", p1Stance);
+    const p2Start = getStartPosition("PLAYER_2", p2Stance);
+    p1Champion.battlePosition = p1Start;
+    p2Champion.battlePosition = p2Start;
+    getCell(grid, p1Start).occupantId = p1Champion.championId;
+    getCell(grid, p2Start).occupantId = p2Champion.championId;
+    p1Champion.currentEnergy = Math.min(p1Champion.currentEnergy + ENERGY_PER_ROUND, MAX_ENERGY);
+    p2Champion.currentEnergy = Math.min(p2Champion.currentEnergy + ENERGY_PER_ROUND, MAX_ENERGY);
+    const frontZone = lane.zones[lane.frontlinePosition];
+    const p1MinionCount = Math.min(frontZone.minions.player1.count, MAX_BATTLE_MINIONS_PER_SIDE);
+    const p2MinionCount = Math.min(frontZone.minions.player2.count, MAX_BATTLE_MINIONS_PER_SIDE);
+    const p1Minions = createBattleMinions("PLAYER_1", p1MinionCount, grid);
+    const p2Minions = createBattleMinions("PLAYER_2", p2MinionCount, grid);
+    const allMinions = [...p1Minions, ...p2Minions];
+    const turnOrder = buildTurnOrder(
+      p1Champion,
+      p2Champion,
+      p1Stance,
+      p2Stance,
+      p1Minions,
+      p2Minions
+    );
+    return {
+      laneId,
+      roundNumber: 1,
+      grid,
+      turnOrder,
+      currentTurnIndex: 0,
+      champions: [
+        { championRef: p1Champion, position: p1Start, hasActed: false },
+        { championRef: p2Champion, position: p2Start, hasActed: false }
+      ],
+      minions: allMinions,
+      isComplete: false,
+      outcome: null
+    };
+  }
+  function getStartPosition(playerId, stance) {
+    if (playerId === "PLAYER_1") {
+      switch (stance) {
+        case "AGGRO" /* Aggro */:
+          return { q: 2, r: 2 };
+        case "DEFEND" /* Defend */:
+          return { q: 0, r: 2 };
+        case "NEUTRAL" /* Neutral */:
+          return { q: 1, r: 2 };
+        case "AMBUSH" /* Ambush */:
+          return { q: 2, r: 0 };
+      }
+    } else {
+      switch (stance) {
+        case "AGGRO" /* Aggro */:
+          return { q: 4, r: 2 };
+        case "DEFEND" /* Defend */:
+          return { q: 6, r: 2 };
+        case "NEUTRAL" /* Neutral */:
+          return { q: 5, r: 2 };
+        case "AMBUSH" /* Ambush */:
+          return { q: 4, r: 4 };
+      }
+    }
+  }
+  function createBattleMinions(ownerId, count, grid) {
+    const minions = [];
+    const positions = ownerId === "PLAYER_1" ? [
+      { q: 1, r: 1 },
+      { q: 1, r: 3 },
+      { q: 2, r: 1 }
+    ] : [
+      { q: 5, r: 1 },
+      { q: 5, r: 3 },
+      { q: 4, r: 3 }
+    ];
+    for (let i = 0; i < count && i < positions.length; i++) {
+      const id = generateId("MINION");
+      const pos = positions[i];
+      minions.push({
+        minionId: id,
+        templateId: "STANDARD_MINION",
+        ownerId,
+        hp: MINION_BASE_HP,
+        maxHp: MINION_BASE_HP,
+        attack: MINION_BASE_ATTACK,
+        position: pos,
+        isAlive: true
+      });
+      const cell = getCell(grid, pos);
+      if (cell) cell.occupantId = id;
+    }
+    return minions;
+  }
+  function executeBattleRound(battle, actionProvider) {
+    for (const bc of battle.champions) bc.hasActed = false;
+    for (let i = 0; i < battle.turnOrder.length; i++) {
+      if (battle.isComplete) break;
+      const unitId = battle.turnOrder[i];
+      battle.currentTurnIndex = i;
+      const unit = findUnitById(battle, unitId);
+      if (!unit || !isUnitAlive(unit)) continue;
+      if (unit.kind === "champion") {
+        const isStunned = unit.ref.statusEffects.some(
+          (e) => e.type === "STUN" /* Stun */ && e.remainingDuration > 0
+        );
+        if (!isStunned) {
+          const action = actionProvider(unitId, battle);
+          executeChampionAction(action, unit.ref, battle);
+        }
+        const bc = battle.champions.find((c) => c.championRef.championId === unitId);
+        if (bc) bc.hasActed = true;
+      } else {
+        executeMinionTurn(unit.ref, battle);
+      }
+      removeDeadFromGrid(battle);
+      if (checkBattleEnd(battle)) {
+        battle.isComplete = true;
+      }
+    }
+    if (!battle.isComplete) {
+      for (const bc of battle.champions) {
+        const champ = bc.championRef;
+        if (champ.isAlive) {
+          champ.currentEnergy = Math.min(champ.currentEnergy + ENERGY_PER_ROUND, MAX_ENERGY);
+          for (const ability of champ.abilities) {
+            if (ability.cooldownRemaining > 0) ability.cooldownRemaining -= 1;
+          }
+          champ.statusEffects = champ.statusEffects.map((e) => ({ ...e, remainingDuration: e.remainingDuration - 1 })).filter((e) => e.remainingDuration > 0);
+        }
+      }
+    }
+    battle.roundNumber += 1;
+    if (battle.roundNumber > BATTLE_ROUND_LIMIT && !battle.isComplete) {
+      battle.isComplete = true;
+    }
+  }
+  function executeChampionAction(action, champion, battle) {
+    switch (action.actionType) {
+      case "MOVE" /* Move */:
+        if (action.targetHex) {
+          executeMove({ kind: "champion", ref: champion }, action.targetHex, battle, champion.moveSpeed);
+        }
+        break;
+      case "ATTACK" /* Attack */:
+        if (action.targetId) {
+          const target = findUnitById(battle, action.targetId);
+          if (target && isUnitAlive(target)) {
+            executeBasicAttack({ kind: "champion", ref: champion }, target, battle);
+          }
+        }
+        break;
+      case "ABILITY" /* Ability */:
+        if (action.abilityId) {
+          const ability = champion.abilities.find((a) => a.abilityId === action.abilityId);
+          if (ability) {
+            executeAbility(champion, ability, action.targetId, action.targetHex, battle);
+          }
+        }
+        break;
+      case "DEFEND" /* Defend */:
+        executeDefend(champion);
+        break;
+      case "WAIT" /* Wait */:
+        executeWait(champion);
+        break;
+    }
+  }
+  function removeDeadFromGrid(battle) {
+    for (const bc of battle.champions) {
+      if (!bc.championRef.isAlive && bc.championRef.battlePosition) {
+        const cell = getCell(battle.grid, bc.championRef.battlePosition);
+        if (cell && cell.occupantId === bc.championRef.championId) {
+          cell.occupantId = null;
+        }
+      }
+    }
+    for (const m of battle.minions) {
+      if (!m.isAlive) {
+        const cell = getCell(battle.grid, m.position);
+        if (cell && cell.occupantId === m.minionId) {
+          cell.occupantId = null;
+        }
+      }
+    }
+  }
+  function checkBattleEnd(battle) {
+    const p1Alive = battle.champions.some(
+      (c) => c.championRef.ownerId === "PLAYER_1" && c.championRef.isAlive
+    );
+    const p2Alive = battle.champions.some(
+      (c) => c.championRef.ownerId === "PLAYER_2" && c.championRef.isAlive
+    );
+    if (!p1Alive || !p2Alive) return true;
+    return false;
+  }
+  function calculateBattleOutcome(battle) {
+    let p1Score = 0;
+    let p2Score = 0;
+    const p1Champ = battle.champions.find((c) => c.championRef.ownerId === "PLAYER_1").championRef;
+    const p2Champ = battle.champions.find((c) => c.championRef.ownerId === "PLAYER_2").championRef;
+    if (!p1Champ.isAlive) p2Score += 10;
+    if (!p2Champ.isAlive) p1Score += 10;
+    const p1Minions = battle.minions.filter((m) => m.ownerId === "PLAYER_1" && m.isAlive).length;
+    const p2Minions = battle.minions.filter((m) => m.ownerId === "PLAYER_2" && m.isAlive).length;
+    p1Score += p1Minions * 2;
+    p2Score += p2Minions * 2;
+    if (p1Champ.isAlive) p1Score += Math.floor(p1Champ.currentHp / p1Champ.maxHp * 5);
+    if (p2Champ.isAlive) p2Score += Math.floor(p2Champ.currentHp / p2Champ.maxHp * 5);
+    let winner = null;
+    if (p1Score > p2Score) winner = "PLAYER_1";
+    else if (p2Score > p1Score) winner = "PLAYER_2";
+    let lanePushBonus = 0;
+    if (winner !== null) {
+      const diff = Math.abs(p1Score - p2Score);
+      if (diff >= 10) lanePushBonus = 2;
+      else if (diff >= 5) lanePushBonus = 1;
+    }
+    const goldAwarded = { PLAYER_1: 0, PLAYER_2: 0 };
+    const xpAwarded = { PLAYER_1: 0, PLAYER_2: 0 };
+    const championDeaths = [];
+    if (!p1Champ.isAlive) {
+      goldAwarded.PLAYER_2 += CHAMPION_KILL_GOLD;
+      xpAwarded.PLAYER_2 += 3;
+      championDeaths.push("PLAYER_1");
+    }
+    if (!p2Champ.isAlive) {
+      goldAwarded.PLAYER_1 += CHAMPION_KILL_GOLD;
+      xpAwarded.PLAYER_1 += 3;
+      championDeaths.push("PLAYER_2");
+    }
+    const p1DeadMinions = battle.minions.filter(
+      (m) => m.ownerId === "PLAYER_1" && !m.isAlive
+    ).length;
+    const p2DeadMinions = battle.minions.filter(
+      (m) => m.ownerId === "PLAYER_2" && !m.isAlive
+    ).length;
+    goldAwarded.PLAYER_1 += p2DeadMinions * MINION_KILL_GOLD;
+    goldAwarded.PLAYER_2 += p1DeadMinions * MINION_KILL_GOLD;
+    return {
+      winner,
+      lanePushBonus,
+      goldAwarded,
+      xpAwarded,
+      championDeaths,
+      damageToStructures: winner ? lanePushBonus : 0
+    };
+  }
+  function runBattle(laneId, lane, p1Champion, p2Champion, p1Stance, p2Stance, actionProvider) {
+    const battle = setupBattle(laneId, lane, p1Champion, p2Champion, p1Stance, p2Stance);
+    while (!battle.isComplete && battle.roundNumber <= BATTLE_ROUND_LIMIT) {
+      executeBattleRound(battle, actionProvider);
+    }
+    const outcome = calculateBattleOutcome(battle);
+    battle.outcome = outcome;
+    return outcome;
+  }
+
+  // src/systems/game-loop.ts
+  function createGameState(p1ChampionDef, p2ChampionDef, cardPool, laneIds = ["MID" /* Mid */]) {
+    const p1Deck = createPlayerDeck(cardPool);
+    const p2Deck = createPlayerDeck(cardPool);
+    const players = [
+      {
+        playerId: "PLAYER_1",
+        gold: STARTING_GOLD,
+        champions: [createChampionFromDefinition(p1ChampionDef, "PLAYER_1")],
+        hand: p1Deck.hand,
+        deck: p1Deck.deck,
+        discard: p1Deck.discard
+      },
+      {
+        playerId: "PLAYER_2",
+        gold: STARTING_GOLD,
+        champions: [createChampionFromDefinition(p2ChampionDef, "PLAYER_2")],
+        hand: p2Deck.hand,
+        deck: p2Deck.deck,
+        discard: p2Deck.discard
+      }
+    ];
+    const lanes = {};
+    for (const id of laneIds) {
+      lanes[id] = createLaneState(id);
+    }
+    return {
+      turnNumber: 1,
+      phase: "PLANNING" /* Planning */,
+      result: "IN_PROGRESS" /* InProgress */,
+      players,
+      lanes,
+      activeBattles: [],
+      turnLog: []
+    };
+  }
+  function executeTurn(gameState, p1Submission, p2Submission, battleActionProvider) {
+    startOfTurnMaintenance(gameState);
+    gameState.phase = "RESOLUTION" /* Resolution */;
+    const resolutionResults = [];
+    const battleTriggers = [];
+    let totalGoldP1 = 0;
+    let totalGoldP2 = 0;
+    for (const laneId of Object.keys(gameState.lanes)) {
+      const lane = gameState.lanes[laneId];
+      const p1Assignment = getLaneAssignment(p1Submission, laneId);
+      const p2Assignment = getLaneAssignment(p2Submission, laneId);
+      const p1Card = p1Assignment ? findCardInDiscard(gameState.players[0], p1Assignment.cardId) : null;
+      const p2Card = p2Assignment ? findCardInDiscard(gameState.players[1], p2Assignment.cardId) : null;
+      const p1Champion = p1Assignment?.championId ? findChampion(gameState.players[0], p1Assignment.championId) : null;
+      const p2Champion = p2Assignment?.championId ? findChampion(gameState.players[1], p2Assignment.championId) : null;
+      const p1SpawnCount = getSpawnOrder(p1Submission, laneId)?.count ?? 0;
+      const p2SpawnCount = getSpawnOrder(p2Submission, laneId)?.count ?? 0;
+      const resolved = resolveLane(
+        lane,
+        p1Card,
+        p2Card,
+        p1Champion,
+        p2Champion,
+        p1SpawnCount,
+        p2SpawnCount
+      );
+      resolutionResults.push(resolved.result);
+      totalGoldP1 += resolved.goldAwarded.player1;
+      totalGoldP2 += resolved.goldAwarded.player2;
+      if (resolved.battleTriggered && p1Champion && p2Champion && p1Card && p2Card) {
+        battleTriggers.push({
+          laneId,
+          p1Stance: p1Card.stance,
+          p2Stance: p2Card.stance
+        });
+      }
+    }
+    gameState.players[0].gold += totalGoldP1;
+    gameState.players[1].gold += totalGoldP2;
+    gameState.phase = "BATTLE" /* Battle */;
+    const battleResults = [];
+    for (const trigger of battleTriggers) {
+      const lane = gameState.lanes[trigger.laneId];
+      const p1Champion = getActiveLaneChampion(gameState.players[0], trigger.laneId);
+      const p2Champion = getActiveLaneChampion(gameState.players[1], trigger.laneId);
+      if (!p1Champion || !p2Champion) continue;
+      const outcome = runBattle(
+        trigger.laneId,
+        lane,
+        p1Champion,
+        p2Champion,
+        trigger.p1Stance,
+        trigger.p2Stance,
+        battleActionProvider
+      );
+      battleResults.push(outcome);
+      applyBattleOutcome(outcome, lane, gameState);
+    }
+    gameState.turnLog.push({
+      turnNumber: gameState.turnNumber,
+      planningSubmissions: [p1Submission, p2Submission],
+      resolutionResults,
+      battleResults,
+      goldChanges: {
+        PLAYER_1: totalGoldP1,
+        PLAYER_2: totalGoldP2
+      }
+    });
+    gameState.result = checkWinCondition(gameState);
+    gameState.turnNumber += 1;
+    gameState.phase = "PLANNING" /* Planning */;
+  }
+  function startOfTurnMaintenance(gameState) {
+    for (const player of gameState.players) {
+      for (const champion of player.champions) {
+        tickRespawn(champion);
+        tickCooldowns(champion);
+        champion.currentZone = null;
+        champion.battlePosition = null;
+      }
+    }
+    for (const laneId of Object.keys(gameState.lanes)) {
+      const lane = gameState.lanes[laneId];
+      for (const zone of lane.zones) {
+        zone.championsPresent = [];
+      }
+    }
+  }
+  function findCardInDiscard(player, cardId) {
+    return player.discard.find((c) => c.cardId === cardId) ?? null;
+  }
+  function findChampion(player, championId) {
+    return player.champions.find((c) => c.championId === championId) ?? null;
+  }
+  function getActiveLaneChampion(player, laneId) {
+    return player.champions.find(
+      (c) => c.assignedLane === laneId && c.isAlive
+    ) ?? null;
+  }
+  function applyBattleOutcome(outcome, lane, gameState) {
+    if (outcome.winner === "PLAYER_1") {
+      lane.frontlinePosition = clamp(
+        lane.frontlinePosition + outcome.lanePushBonus,
+        0,
+        LANE_ZONE_COUNT - 1
+      );
+    } else if (outcome.winner === "PLAYER_2") {
+      lane.frontlinePosition = clamp(
+        lane.frontlinePosition - outcome.lanePushBonus,
+        0,
+        LANE_ZONE_COUNT - 1
+      );
+    }
+    for (const pid of ["PLAYER_1", "PLAYER_2"]) {
+      const player = gameState.players[pid === "PLAYER_1" ? 0 : 1];
+      player.gold += outcome.goldAwarded[pid];
+      for (const champ of player.champions) {
+        champ.xp += outcome.xpAwarded[pid];
+        checkLevelUp(champ);
+      }
+    }
+    for (const deadOwner of outcome.championDeaths) {
+      const player = gameState.players[deadOwner === "PLAYER_1" ? 0 : 1];
+      for (const champ of player.champions) {
+        if (!champ.isAlive) {
+          killChampion(champ);
+        }
+      }
+    }
+    if (outcome.damageToStructures > 0 && outcome.winner) {
+      const loserId = outcome.winner === "PLAYER_1" ? "player2" : "player1";
+      if (outcome.winner === "PLAYER_1" && lane.frontlinePosition >= 5 || outcome.winner === "PLAYER_2" && lane.frontlinePosition <= 1) {
+        if (lane.towerHp[loserId] > 0) {
+          lane.towerHp[loserId] = Math.max(
+            0,
+            lane.towerHp[loserId] - outcome.damageToStructures
+          );
+        } else {
+          lane.baseHp[loserId] = Math.max(
+            0,
+            lane.baseHp[loserId] - outcome.damageToStructures
+          );
+        }
+      }
+    }
+  }
+  function checkWinCondition(gameState) {
+    for (const laneId of Object.keys(gameState.lanes)) {
+      const lane = gameState.lanes[laneId];
+      if (lane.baseHp.player1 <= 0) return "PLAYER_2_WINS" /* Player2Wins */;
+      if (lane.baseHp.player2 <= 0) return "PLAYER_1_WINS" /* Player1Wins */;
+    }
+    if (gameState.turnNumber >= MAX_TURNS) {
+      let p1TotalHp = 0;
+      let p2TotalHp = 0;
+      for (const laneId of Object.keys(gameState.lanes)) {
+        const lane = gameState.lanes[laneId];
+        p1TotalHp += lane.towerHp.player1 + lane.baseHp.player1;
+        p2TotalHp += lane.towerHp.player2 + lane.baseHp.player2;
+      }
+      if (p1TotalHp > p2TotalHp) return "PLAYER_1_WINS" /* Player1Wins */;
+      if (p2TotalHp > p1TotalHp) return "PLAYER_2_WINS" /* Player2Wins */;
+      return "DRAW" /* Draw */;
+    }
+    return "IN_PROGRESS" /* InProgress */;
+  }
+
+  // src/systems/economy-system.ts
+  function deductSpawnCost(player, orders) {
+    const totalCost = orders.reduce((sum, o) => sum + o.count * MINION_SPAWN_COST, 0);
+    player.gold -= totalCost;
+  }
+
+  // src/systems/planning-system.ts
+  function applyPlanningInput(input, player) {
+    const card = playCard(player, input.cardId);
+    const champ = player.champions.find((c) => c.championId === input.championId);
+    champ.assignedLane = input.laneId;
+    champ.laneStance = card.stance;
+    const spawnOrders = [
+      { laneId: input.laneId, count: input.minionSpawnCount }
+    ];
+    deductSpawnCost(player, spawnOrders);
+    return {
+      playerId: player.playerId,
+      laneAssignments: [
+        {
+          laneId: input.laneId,
+          cardId: input.cardId,
+          championId: input.championId
+        }
+      ],
+      minionSpawnOrders: spawnOrders
+    };
+  }
+  function createEmptySubmission(playerId) {
+    return {
+      playerId,
+      laneAssignments: [],
+      minionSpawnOrders: []
+    };
+  }
+  function preparePlanningPhase(gameState) {
+    for (const player of gameState.players) {
+      drawToHandLimit(player);
+    }
+  }
+
+  // src/data/champions/ironclad.ts
+  var IRONCLAD = {
+    championId: "IRONCLAD",
+    name: "Ironclad",
+    role: "TANK" /* Tank */,
+    maxHp: 20,
+    armor: 3,
+    magicResist: 1,
+    maxEnergy: 6,
+    moveSpeed: 2,
+    attackRange: 1,
+    attackDamage: 3,
+    damageType: "PHYSICAL" /* Physical */,
+    abilities: [
+      {
+        abilityId: "SHIELD_BASH",
+        name: "Shield Bash",
+        description: "Advance and bash an enemy, pushing them back 1 hex.",
+        energyCost: 2,
+        cooldownMax: 1,
+        range: 1,
+        targetType: "SINGLE_ENEMY" /* SingleEnemy */,
+        damageType: "PHYSICAL" /* Physical */,
+        baseDamage: 4,
+        aoeRadius: 0,
+        effects: [{ type: "PUSH", value: 1, duration: 0 }],
+        scriptedActions: [
+          { type: "MOVE" /* Move */, distance: 1, target: "SINGLE_ENEMY" /* SingleEnemy */ },
+          {
+            type: "ATTACK" /* Attack */,
+            damage: 4,
+            damageType: "PHYSICAL" /* Physical */,
+            effects: [{ type: "PUSH", value: 1, duration: 0 }]
+          }
+        ]
+      },
+      {
+        abilityId: "FORTRESS",
+        name: "Fortress",
+        description: "Brace for impact, gaining a shield that absorbs 4 damage for 2 rounds.",
+        energyCost: 3,
+        cooldownMax: 2,
+        range: 0,
+        targetType: "SELF" /* Self */,
+        damageType: "PHYSICAL" /* Physical */,
+        baseDamage: 0,
+        aoeRadius: 0,
+        effects: [{ type: "SHIELD" /* Shield */, value: 4, duration: 2 }],
+        scriptedActions: [
+          {
+            type: "DEFEND" /* Defend */,
+            effects: [{ type: "SHIELD" /* Shield */, value: 4, duration: 2 }]
+          }
+        ]
+      },
+      {
+        abilityId: "CHARGE",
+        name: "Charge",
+        description: "Rush up to 3 hexes toward an enemy, dealing damage and stunning them.",
+        energyCost: 2,
+        cooldownMax: 1,
+        range: 3,
+        targetType: "SINGLE_ENEMY" /* SingleEnemy */,
+        damageType: "PHYSICAL" /* Physical */,
+        baseDamage: 2,
+        aoeRadius: 0,
+        effects: [{ type: "STUN" /* Stun */, value: 0, duration: 1 }],
+        scriptedActions: [
+          { type: "MOVE" /* Move */, distance: 3, target: "SINGLE_ENEMY" /* SingleEnemy */ },
+          {
+            type: "ATTACK" /* Attack */,
+            damage: 2,
+            damageType: "PHYSICAL" /* Physical */,
+            effects: [{ type: "STUN" /* Stun */, value: 0, duration: 1 }]
+          }
+        ]
+      }
+    ]
+  };
+
+  // src/data/champions/pyrox.ts
+  var PYROX = {
+    championId: "PYROX",
+    name: "Pyrox",
+    role: "MAGE" /* Mage */,
+    maxHp: 14,
+    armor: 1,
+    magicResist: 2,
+    maxEnergy: 6,
+    moveSpeed: 2,
+    attackRange: 2,
+    attackDamage: 2,
+    damageType: "MAGICAL" /* Magical */,
+    abilities: [
+      {
+        abilityId: "FIREBALL",
+        name: "Fireball",
+        description: "Hurl a fireball at a target area, dealing 5 damage in a 1-hex radius.",
+        energyCost: 3,
+        cooldownMax: 1,
+        range: 3,
+        targetType: "AOE" /* AreaOfEffect */,
+        damageType: "MAGICAL" /* Magical */,
+        baseDamage: 5,
+        aoeRadius: 1,
+        effects: [],
+        scriptedActions: [
+          {
+            type: "ABILITY" /* Ability */,
+            damage: 5,
+            damageType: "MAGICAL" /* Magical */,
+            target: "AOE" /* AreaOfEffect */
+          }
+        ]
+      },
+      {
+        abilityId: "BLINK",
+        name: "Blink",
+        description: "Teleport up to 3 hexes to any open position.",
+        energyCost: 2,
+        cooldownMax: 2,
+        range: 3,
+        targetType: "SELF" /* Self */,
+        damageType: "MAGICAL" /* Magical */,
+        baseDamage: 0,
+        aoeRadius: 0,
+        effects: [],
+        scriptedActions: [{ type: "MOVE" /* Move */, distance: 3 }]
+      },
+      {
+        abilityId: "FLAME_WAVE",
+        name: "Flame Wave",
+        description: "Send a wave of fire in a cone, dealing 3 damage to all enemies hit.",
+        energyCost: 2,
+        cooldownMax: 1,
+        range: 2,
+        targetType: "CONE" /* Cone */,
+        damageType: "MAGICAL" /* Magical */,
+        baseDamage: 3,
+        aoeRadius: 0,
+        effects: [],
+        scriptedActions: [
+          {
+            type: "ABILITY" /* Ability */,
+            damage: 3,
+            damageType: "MAGICAL" /* Magical */,
+            target: "CONE" /* Cone */
+          }
+        ]
+      }
+    ]
+  };
+
+  // src/data/cards/planning-cards.ts
+  var ADVANCE = {
+    cardId: "ADVANCE",
+    name: "Advance",
+    stance: "AGGRO" /* Aggro */,
+    effects: [],
+    priority: 2
+  };
+  var RALLY_CHARGE = {
+    cardId: "RALLY_CHARGE",
+    name: "Rally Charge",
+    stance: "AGGRO" /* Aggro */,
+    effects: [{ type: "BONUS_MINIONS" /* BonusMinions */, value: 1 }],
+    priority: 1
+  };
+  var HOLD_THE_LINE = {
+    cardId: "HOLD_THE_LINE",
+    name: "Hold the Line",
+    stance: "DEFEND" /* Defend */,
+    effects: [{ type: "TOWER_DAMAGE_REDUCTION" /* TowerDamageReduction */, value: 2 }],
+    priority: 3
+  };
+  var FORTIFY = {
+    cardId: "FORTIFY",
+    name: "Fortify",
+    stance: "DEFEND" /* Defend */,
+    effects: [{ type: "FORTIFY_MINIONS" /* FortifyMinions */, value: 1 }],
+    priority: 4
+  };
+  var STEADY_PUSH = {
+    cardId: "STEADY_PUSH",
+    name: "Steady Push",
+    stance: "NEUTRAL" /* Neutral */,
+    effects: [{ type: "BONUS_GOLD" /* BonusGold */, value: 1 }],
+    priority: 3
+  };
+  var GATHER_INTEL = {
+    cardId: "GATHER_INTEL",
+    name: "Gather Intel",
+    stance: "NEUTRAL" /* Neutral */,
+    effects: [{ type: "SCOUT_REVEAL" /* ScoutReveal */, value: 1 }],
+    priority: 2
+  };
+  var FLANK_STRIKE = {
+    cardId: "FLANK_STRIKE",
+    name: "Flank Strike",
+    stance: "AMBUSH" /* Ambush */,
+    effects: [],
+    priority: 1
+  };
+  var SHADOW_ASSAULT = {
+    cardId: "SHADOW_ASSAULT",
+    name: "Shadow Assault",
+    stance: "AMBUSH" /* Ambush */,
+    effects: [{ type: "MINION_DAMAGE_BOOST" /* MinionDamageBoost */, value: 1 }],
+    priority: 1
+  };
+  var ALL_PLANNING_CARDS = [
+    ADVANCE,
+    RALLY_CHARGE,
+    HOLD_THE_LINE,
+    FORTIFY,
+    STEADY_PUSH,
+    GATHER_INTEL,
+    FLANK_STRIKE,
+    SHADOW_ASSAULT
+  ];
+
+  // src/web/game-controller.ts
+  function battleAI(unitId, battle) {
+    const bc = battle.champions.find((c) => c.championRef.championId === unitId);
+    if (!bc) return { actorId: unitId, actionType: "WAIT" /* Wait */ };
+    const champ = bc.championRef;
+    const enemy = battle.champions.find(
+      (c) => c.championRef.ownerId !== champ.ownerId && c.championRef.isAlive
+    );
+    if (!enemy) return { actorId: unitId, actionType: "WAIT" /* Wait */ };
+    const myPos = champ.battlePosition;
+    const enemyPos = enemy.championRef.battlePosition;
+    const dist = Math.max(
+      Math.abs(myPos.q - enemyPos.q),
+      Math.abs(myPos.r - enemyPos.r),
+      Math.abs(myPos.q + myPos.r - (enemyPos.q + enemyPos.r))
+    );
+    for (const ability of champ.abilities) {
+      if (ability.cooldownRemaining === 0 && champ.currentEnergy >= ability.energyCost && ability.baseDamage > 0 && dist <= ability.range) {
+        return {
+          actorId: unitId,
+          actionType: "ABILITY" /* Ability */,
+          abilityId: ability.abilityId,
+          targetId: enemy.championRef.championId,
+          targetHex: enemyPos
+        };
+      }
+    }
+    if (dist <= champ.attackRange) {
+      return {
+        actorId: unitId,
+        actionType: "ATTACK" /* Attack */,
+        targetId: enemy.championRef.championId
+      };
+    }
+    return {
+      actorId: unitId,
+      actionType: "MOVE" /* Move */,
+      targetHex: enemyPos
+    };
+  }
+  var GameController = class {
+    constructor() {
+      __publicField(this, "state");
+      __publicField(this, "phase");
+      __publicField(this, "p1Submission", null);
+      __publicField(this, "lastTurnLog", null);
+      __publicField(this, "message", "Player 1: Choose a card and spawn minions.");
+      __publicField(this, "laneId", "MID" /* Mid */);
+      resetIdCounter();
+      this.state = createGameState(IRONCLAD, PYROX, ALL_PLANNING_CARDS, ["MID" /* Mid */]);
+      preparePlanningPhase(this.state);
+      this.phase = "P1_PLANNING";
+    }
+    restart() {
+      resetIdCounter();
+      this.state = createGameState(IRONCLAD, PYROX, ALL_PLANNING_CARDS, ["MID" /* Mid */]);
+      preparePlanningPhase(this.state);
+      this.phase = "P1_PLANNING";
+      this.p1Submission = null;
+      this.lastTurnLog = null;
+      this.message = "Player 1: Choose a card and spawn minions.";
+    }
+    getPlayerHand(playerId) {
+      const idx = playerId === "PLAYER_1" ? 0 : 1;
+      return this.state.players[idx].hand;
+    }
+    getMaxSpawns(playerId) {
+      const idx = playerId === "PLAYER_1" ? 0 : 1;
+      const gold = this.state.players[idx].gold;
+      return Math.min(MAX_MINIONS_PER_SPAWN, Math.floor(gold / MINION_SPAWN_COST));
+    }
+    isChampionAlive(playerId) {
+      const idx = playerId === "PLAYER_1" ? 0 : 1;
+      const champ = this.state.players[idx].champions[0];
+      return champ?.isAlive ?? false;
+    }
+    submitPlanning(playerId, cardId, spawnCount2) {
+      const idx = playerId === "PLAYER_1" ? 0 : 1;
+      const player = this.state.players[idx];
+      const champ = player.champions[0];
+      if (!champ || !champ.isAlive) {
+        if (playerId === "PLAYER_1") {
+          this.p1Submission = createEmptySubmission("PLAYER_1");
+          this.phase = "P2_PLANNING";
+          this.message = "Player 2: Choose a card and spawn minions.";
+        } else {
+          this.resolveTurn(createEmptySubmission("PLAYER_2"));
+        }
+        return true;
+      }
+      const input = {
+        laneId: this.laneId,
+        cardId,
+        championId: champ.championId,
+        minionSpawnCount: spawnCount2
+      };
+      const submission = applyPlanningInput(input, player);
+      if (playerId === "PLAYER_1") {
+        this.p1Submission = submission;
+        this.phase = "P2_PLANNING";
+        this.message = "Player 2: Choose a card and spawn minions.";
+      } else {
+        this.resolveTurn(submission);
+      }
+      return true;
+    }
+    skipPlanning(playerId) {
+      if (playerId === "PLAYER_1") {
+        this.p1Submission = createEmptySubmission("PLAYER_1");
+        this.phase = "P2_PLANNING";
+        this.message = "Player 2: Choose a card and spawn minions.";
+      } else {
+        this.resolveTurn(createEmptySubmission("PLAYER_2"));
+      }
+    }
+    resolveTurn(p2Submission) {
+      this.phase = "RESOLVING";
+      const p1Sub = this.p1Submission ?? createEmptySubmission("PLAYER_1");
+      executeTurn(this.state, p1Sub, p2Submission, battleAI);
+      this.lastTurnLog = this.state.turnLog[this.state.turnLog.length - 1];
+      const res = this.lastTurnLog.resolutionResults[0];
+      let msg = `Turn ${this.state.turnNumber - 1} complete. `;
+      msg += `Minions: P1 ${res.minionCombatLog.player1MinionsStart}->${res.minionCombatLog.player1MinionsEnd}`;
+      msg += ` | P2 ${res.minionCombatLog.player2MinionsStart}->${res.minionCombatLog.player2MinionsEnd}. `;
+      msg += `Frontline: ${res.frontlineBefore} -> ${res.frontlineAfter}. `;
+      if (res.battleTriggered && this.lastTurnLog.battleResults.length > 0) {
+        const battle = this.lastTurnLog.battleResults[0];
+        msg += `BATTLE! Winner: ${battle.winner ?? "DRAW"}. `;
+        if (battle.championDeaths.length > 0) {
+          msg += `Champion killed: ${battle.championDeaths.join(", ")}. `;
+        }
+      }
+      if (this.state.result !== "IN_PROGRESS" /* InProgress */) {
+        this.phase = "GAME_OVER";
+        this.message = `GAME OVER: ${this.state.result}`;
+      } else {
+        preparePlanningPhase(this.state);
+        this.p1Submission = null;
+        this.phase = "P1_PLANNING";
+        this.message = msg + " Player 1: Choose a card.";
+      }
+    }
+    getUIState() {
+      return {
+        gameState: this.state,
+        phase: this.phase,
+        p1Submission: this.p1Submission,
+        lastTurnLog: this.lastTurnLog,
+        message: this.message
+      };
+    }
+  };
+
+  // src/web/main.ts
+  var controller = new GameController();
+  var selectedCardIndex = -1;
+  var spawnCount = 0;
+  var canvas;
+  var ctx;
+  var buttons = [];
+  var COLORS = {
+    bg: "#1a1a2e",
+    panel: "#16213e",
+    panelLight: "#1c2e4a",
+    accent1: "#e94560",
+    // Player 1 red
+    accent2: "#0f7cba",
+    // Player 2 blue
+    gold: "#f5c518",
+    text: "#eee",
+    textDim: "#888",
+    green: "#44bd32",
+    red: "#e74c3c",
+    lane: "#2d3436",
+    zone: "#3d4a5c",
+    zoneFront: "#5a6e8a",
+    tower: "#f39c12",
+    base: "#e74c3c",
+    card: "#2d3a50",
+    cardHover: "#3d4a60",
+    cardSelected: "#1e6f50",
+    button: "#2ecc71",
+    buttonHover: "#27ae60",
+    stanceAggro: "#e74c3c",
+    stanceDefend: "#3498db",
+    stanceNeutral: "#95a5a6",
+    stanceAmbush: "#9b59b6"
+  };
+  function stanceColor(stance) {
+    switch (stance) {
+      case "AGGRO" /* Aggro */:
+        return COLORS.stanceAggro;
+      case "DEFEND" /* Defend */:
+        return COLORS.stanceDefend;
+      case "NEUTRAL" /* Neutral */:
+        return COLORS.stanceNeutral;
+      case "AMBUSH" /* Ambush */:
+        return COLORS.stanceAmbush;
+    }
+  }
+  function init() {
+    canvas = document.getElementById("game");
+    ctx = canvas.getContext("2d");
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = 900 * dpr;
+    canvas.height = 700 * dpr;
+    canvas.style.width = "900px";
+    canvas.style.height = "700px";
+    ctx.scale(dpr, dpr);
+    canvas.addEventListener("click", handleClick);
+    render();
+  }
+  function handleClick(e) {
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    for (const btn of buttons) {
+      if (mx >= btn.x && mx <= btn.x + btn.w && my >= btn.y && my <= btn.y + btn.h) {
+        btn.action();
+        render();
+        return;
+      }
+    }
+  }
+  function render() {
+    buttons = [];
+    const W = 900;
+    const H = 700;
+    const ui = controller.getUIState();
+    const gs = ui.gameState;
+    const lane = gs.lanes["MID"];
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = COLORS.text;
+    ctx.font = "bold 18px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(`MOBA BOARD GAME \u2014 Turn ${gs.turnNumber}`, W / 2, 30);
+    renderPlayerStats(gs, "PLAYER_1", 20, 50, 420);
+    renderPlayerStats(gs, "PLAYER_2", 460, 50, 420);
+    renderLane(lane, 50, 130, W - 100, 80);
+    ctx.fillStyle = COLORS.gold;
+    ctx.font = "14px monospace";
+    ctx.textAlign = "center";
+    const msgLines = wordWrap(ui.message, 80);
+    msgLines.forEach((line, i) => {
+      ctx.fillText(line, W / 2, 240 + i * 18);
+    });
+    const currentPlayer = ui.phase === "P1_PLANNING" ? "PLAYER_1" : "PLAYER_2";
+    if (ui.phase === "P1_PLANNING" || ui.phase === "P2_PLANNING") {
+      const playerIdx = currentPlayer === "PLAYER_1" ? 0 : 1;
+      const player = gs.players[playerIdx];
+      const hand = player.hand;
+      const champAlive = controller.isChampionAlive(currentPlayer);
+      if (!champAlive) {
+        ctx.fillStyle = COLORS.red;
+        ctx.font = "16px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText("Champion is dead! Click Skip to continue.", W / 2, 320);
+        addButton(W / 2 - 60, 340, 120, 36, "Skip Turn", () => {
+          controller.skipPlanning(currentPlayer);
+          selectedCardIndex = -1;
+          spawnCount = 0;
+        });
+      } else {
+        ctx.fillStyle = COLORS.text;
+        ctx.font = "bold 14px monospace";
+        ctx.textAlign = "left";
+        ctx.fillText(
+          `${currentPlayer === "PLAYER_1" ? "Player 1" : "Player 2"}'s Cards:`,
+          50,
+          290
+        );
+        renderCardHand(hand, 50, 300, W - 100);
+        const maxSpawns = controller.getMaxSpawns(currentPlayer);
+        renderSpawnControls(50, 480, maxSpawns, player.gold);
+        if (selectedCardIndex >= 0) {
+          addButton(W / 2 - 80, 550, 160, 40, "Confirm", () => {
+            const card = hand[selectedCardIndex];
+            controller.submitPlanning(currentPlayer, card.cardId, spawnCount);
+            selectedCardIndex = -1;
+            spawnCount = 0;
+          });
+        }
+      }
+    } else if (ui.phase === "GAME_OVER") {
+      ctx.fillStyle = COLORS.gold;
+      ctx.font = "bold 24px monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(ui.message, W / 2, 350);
+      addButton(W / 2 - 80, 390, 160, 40, "Play Again", () => {
+        controller.restart();
+        selectedCardIndex = -1;
+        spawnCount = 0;
+      });
+    }
+    for (const btn of buttons) {
+      renderButton(btn);
+    }
+  }
+  function renderPlayerStats(gs, playerId, x, y, w) {
+    const idx = playerId === "PLAYER_1" ? 0 : 1;
+    const player = gs.players[idx];
+    const champ = player.champions[0];
+    const color = playerId === "PLAYER_1" ? COLORS.accent1 : COLORS.accent2;
+    ctx.fillStyle = COLORS.panel;
+    ctx.fillRect(x, y, w, 60);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x, y, w, 60);
+    ctx.fillStyle = color;
+    ctx.font = "bold 14px monospace";
+    ctx.textAlign = "left";
+    ctx.fillText(playerId === "PLAYER_1" ? "PLAYER 1" : "PLAYER 2", x + 10, y + 20);
+    ctx.fillStyle = COLORS.text;
+    ctx.font = "12px monospace";
+    if (champ) {
+      const hpPct = champ.currentHp / champ.maxHp;
+      const hpColor = hpPct > 0.5 ? COLORS.green : hpPct > 0.25 ? COLORS.gold : COLORS.red;
+      ctx.fillText(`${champ.name} Lv${champ.level}`, x + 10, y + 38);
+      const barX = x + 140;
+      const barW = 100;
+      ctx.fillStyle = "#333";
+      ctx.fillRect(barX, y + 28, barW, 12);
+      ctx.fillStyle = hpColor;
+      ctx.fillRect(barX, y + 28, barW * hpPct, 12);
+      ctx.fillStyle = COLORS.text;
+      ctx.font = "10px monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(`${champ.currentHp}/${champ.maxHp}`, barX + barW / 2, y + 38);
+      ctx.textAlign = "left";
+      ctx.fillStyle = "#5dade2";
+      ctx.fillText(`E:${champ.currentEnergy}`, barX + barW + 10, y + 38);
+      if (!champ.isAlive) {
+        ctx.fillStyle = COLORS.red;
+        ctx.font = "bold 12px monospace";
+        ctx.fillText("DEAD", barX + barW + 40, y + 38);
+      }
+    }
+    ctx.fillStyle = COLORS.gold;
+    ctx.font = "bold 14px monospace";
+    ctx.textAlign = "right";
+    ctx.fillText(`${player.gold}g`, x + w - 10, y + 20);
+    ctx.fillStyle = COLORS.textDim;
+    ctx.font = "11px monospace";
+    ctx.fillText(`Hand: ${player.hand.length}`, x + w - 10, y + 38);
+    ctx.textAlign = "left";
+  }
+  function renderLane(lane, x, y, w, h) {
+    const zoneW = w / LANE_ZONE_COUNT;
+    ctx.fillStyle = COLORS.lane;
+    ctx.fillRect(x, y, w, h);
+    for (let i = 0; i < LANE_ZONE_COUNT; i++) {
+      const zx = x + i * zoneW;
+      const zone = lane.zones[i];
+      if (i === lane.frontlinePosition) {
+        ctx.fillStyle = COLORS.zoneFront;
+      } else {
+        ctx.fillStyle = COLORS.zone;
+      }
+      ctx.fillRect(zx + 1, y + 1, zoneW - 2, h - 2);
+      ctx.fillStyle = COLORS.textDim;
+      ctx.font = "10px monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(`Z${i}`, zx + zoneW / 2, y + 12);
+      const p1m = zone.minions.player1.count;
+      const p2m = zone.minions.player2.count;
+      if (p1m > 0 || p2m > 0) {
+        ctx.font = "11px monospace";
+        if (p1m > 0) {
+          ctx.fillStyle = COLORS.accent1;
+          ctx.fillText(`${p1m}`, zx + zoneW / 2 - 12, y + h / 2 + 4);
+        }
+        if (p2m > 0) {
+          ctx.fillStyle = COLORS.accent2;
+          ctx.fillText(`${p2m}`, zx + zoneW / 2 + 12, y + h / 2 + 4);
+        }
+      }
+      if (zone.championsPresent.includes("PLAYER_1")) {
+        ctx.fillStyle = COLORS.accent1;
+        ctx.beginPath();
+        ctx.arc(zx + zoneW / 2 - 12, y + h - 14, 5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      if (zone.championsPresent.includes("PLAYER_2")) {
+        ctx.fillStyle = COLORS.accent2;
+        ctx.beginPath();
+        ctx.arc(zx + zoneW / 2 + 12, y + h - 14, 5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      if (i === 0) {
+        ctx.fillStyle = COLORS.base;
+        ctx.font = "bold 10px monospace";
+        ctx.fillText(`B:${lane.baseHp.player1}`, zx + zoneW / 2, y + h - 4);
+      }
+      if (i === 1) {
+        ctx.fillStyle = COLORS.tower;
+        ctx.font = "bold 10px monospace";
+        ctx.fillText(`T:${lane.towerHp.player1}`, zx + zoneW / 2, y + h - 4);
+      }
+      if (i === LANE_ZONE_COUNT - 2) {
+        ctx.fillStyle = COLORS.tower;
+        ctx.font = "bold 10px monospace";
+        ctx.fillText(`T:${lane.towerHp.player2}`, zx + zoneW / 2, y + h - 4);
+      }
+      if (i === LANE_ZONE_COUNT - 1) {
+        ctx.fillStyle = COLORS.base;
+        ctx.font = "bold 10px monospace";
+        ctx.fillText(`B:${lane.baseHp.player2}`, zx + zoneW / 2, y + h - 4);
+      }
+      if (i === lane.frontlinePosition) {
+        ctx.strokeStyle = COLORS.gold;
+        ctx.lineWidth = 2;
+        ctx.strokeRect(zx + 1, y + 1, zoneW - 2, h - 2);
+      }
+    }
+    ctx.fillStyle = COLORS.accent1;
+    ctx.font = "bold 11px monospace";
+    ctx.textAlign = "left";
+    ctx.fillText("P1 Base <", x, y + h + 14);
+    ctx.fillStyle = COLORS.accent2;
+    ctx.textAlign = "right";
+    ctx.fillText("> P2 Base", x + w, y + h + 14);
+  }
+  function renderCardHand(hand, x, y, totalW) {
+    const cardW = Math.min(150, (totalW - 20) / Math.max(hand.length, 1));
+    const cardH = 140;
+    const gap = 8;
+    hand.forEach((card, i) => {
+      const cx = x + i * (cardW + gap);
+      const isSelected = i === selectedCardIndex;
+      ctx.fillStyle = isSelected ? COLORS.cardSelected : COLORS.card;
+      ctx.fillRect(cx, y, cardW, cardH);
+      ctx.strokeStyle = isSelected ? COLORS.green : stanceColor(card.stance);
+      ctx.lineWidth = isSelected ? 3 : 1;
+      ctx.strokeRect(cx, y, cardW, cardH);
+      ctx.fillStyle = stanceColor(card.stance);
+      ctx.fillRect(cx, y, cardW, 22);
+      ctx.fillStyle = "#fff";
+      ctx.font = "bold 11px monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(card.stance, cx + cardW / 2, y + 15);
+      ctx.fillStyle = COLORS.text;
+      ctx.font = "bold 12px monospace";
+      ctx.textAlign = "center";
+      const nameLines = wordWrap(card.name, Math.floor(cardW / 7));
+      nameLines.forEach((line, li) => {
+        ctx.fillText(line, cx + cardW / 2, y + 42 + li * 14);
+      });
+      ctx.fillStyle = COLORS.textDim;
+      ctx.font = "10px monospace";
+      if (card.effects.length > 0) {
+        card.effects.forEach((eff, ei) => {
+          const label = eff.type.replace(/_/g, " ").toLowerCase();
+          ctx.fillText(`+${eff.value} ${label}`, cx + cardW / 2, y + 80 + ei * 14);
+        });
+      } else {
+        ctx.fillText("(no bonus)", cx + cardW / 2, y + 80);
+      }
+      ctx.fillStyle = COLORS.textDim;
+      ctx.font = "9px monospace";
+      ctx.fillText(`[${i + 1}]`, cx + cardW / 2, y + cardH - 6);
+      addButton(cx, y, cardW, cardH, "", () => {
+        selectedCardIndex = i;
+        spawnCount = 0;
+      });
+    });
+  }
+  function renderSpawnControls(x, y, maxSpawns, gold) {
+    ctx.fillStyle = COLORS.text;
+    ctx.font = "bold 13px monospace";
+    ctx.textAlign = "left";
+    ctx.fillText(`Spawn Minions: ${spawnCount}  (cost: ${spawnCount * MINION_SPAWN_COST}g)`, x, y);
+    addButton(x + 280, y - 14, 30, 22, "-", () => {
+      if (spawnCount > 0) spawnCount--;
+    });
+    addButton(x + 318, y - 14, 30, 22, "+", () => {
+      if (spawnCount < maxSpawns) spawnCount++;
+    });
+    ctx.fillStyle = COLORS.textDim;
+    ctx.font = "11px monospace";
+    ctx.fillText(`(max ${maxSpawns}, ${MINION_SPAWN_COST}g each)`, x + 360, y);
+  }
+  function addButton(x, y, w, h, label, action) {
+    buttons.push({ x, y, w, h, label, action });
+  }
+  function renderButton(btn) {
+    if (!btn.label) return;
+    ctx.fillStyle = COLORS.button;
+    ctx.fillRect(btn.x, btn.y, btn.w, btn.h);
+    ctx.strokeStyle = "#1a8a4a";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(btn.x, btn.y, btn.w, btn.h);
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 14px monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(btn.label, btn.x + btn.w / 2, btn.y + btn.h / 2);
+    ctx.textBaseline = "alphabetic";
+  }
+  function wordWrap(text, maxLen) {
+    const words = text.split(" ");
+    const lines = [];
+    let current = "";
+    for (const word of words) {
+      if (current.length + word.length + 1 > maxLen) {
+        lines.push(current);
+        current = word;
+      } else {
+        current = current ? current + " " + word : word;
+      }
+    }
+    if (current) lines.push(current);
+    return lines;
+  }
+  window.addEventListener("DOMContentLoaded", init);
+})();
+  </script>
+</body>
+</html>
